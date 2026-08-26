@@ -26,9 +26,11 @@ const SHEET_HEADER = [
 // Storage (IndexedDB via idb-keyval)
 // ---------------------------------------------------------------------
 
-const casesStore = new idbKeyval.Store("chargecap-db", "cases");
-const metaStore = new idbKeyval.Store("chargecap-db", "meta");
-const codesStore = new idbKeyval.Store("chargecap-db", "codes");
+// v6 of idb-keyval uses createStore(dbName, storeName) — a factory
+// function, not a "new Store(...)" class constructor.
+const casesStore = idbKeyval.createStore("chargecap-db", "cases");
+const metaStore = idbKeyval.createStore("chargecap-db", "meta");
+const codesStore = idbKeyval.createStore("chargecap-db", "codes");
 
 let CASES = []; // in-memory cache, source of truth is IndexedDB
 let SYNC_QUEUE = [];
