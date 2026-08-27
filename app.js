@@ -201,6 +201,7 @@ const state = {
   casesFilter: "all", // 'all' | 'pending' | 'billed'
   casesSearch: "",
   codePicker: null, // { type: 'cpt'|'icd10', category, search }
+  cropSource: null, // { file, url, naturalWidth, naturalHeight } — set while the crop-before-scan screen is open
   editingCaseId: null,
   ocrBusy: false,
   showRawOcr: false,
@@ -255,6 +256,198 @@ async function runOcr(file) {
     state.ocrBusy = false;
     render();
   }
+}
+
+// Runs OCR on whatever image (original photo or a cropped Blob from
+// the crop screen below) and applies the result to the in-progress
+// draft. Shared by both the "use full photo" path and the "use this
+// crop" path so they stay in sync.
+async function runOcrAndApply(fileOrBlob) {
+  const d = state.draft;
+  try {
+    const extracted = await runOcr(fileOrBlob);
+    Object.assign(d, {
+      patientName: extracted.patientName || d.patientName,
+      mrn: extracted.mrn || d.mrn,
+      dob: extracted.dob || d.dob,
+      lowConfidenceFields: extracted.lowConfidenceFields,
+      rawOcrText: extracted.rawText || "",
+    });
+    render();
+    toast("Scan complete — review highlighted fields");
+  } catch (err) {
+    console.error(err);
+    toast("OCR failed — enter details manually", true);
+  }
+}
+
+// ---------------------------------------------------------------------
+// Crop-before-scan
+// ---------------------------------------------------------------------
+//
+// Opens the crop screen for a just-picked/taken photo instead of
+// running OCR on it immediately. Reading the image's natural size
+// first (rather than trusting CSS-driven layout alone) is what makes
+// the crop rectangle's pixel math against the ORIGINAL photo exact —
+// see confirmCrop below.
+function startCropSession(file) {
+  const url = URL.createObjectURL(file);
+  const probe = new Image();
+  probe.onload = () => {
+    state.cropSource = { file, url, naturalWidth: probe.naturalWidth, naturalHeight: probe.naturalHeight };
+    render();
+  };
+  probe.onerror = () => {
+    // Can't even decode it as an image here — don't block the scan on
+    // a crop step that can't work; just run OCR on the original file.
+    URL.revokeObjectURL(url);
+    runOcrAndApply(file);
+  };
+  probe.src = url;
+}
+
+function closeCropSession() {
+  if (state.cropSource) URL.revokeObjectURL(state.cropSource.url);
+  state.cropSource = null;
+}
+
+// Wires up the crop screen's drag-to-move / drag-to-resize rectangle.
+// Deliberately does NOT go through state + render() on every pointer
+// move — that would tear down and rebuild the image/canvas on every
+// frame of a drag, which is both janky and would lose the gesture
+// mid-drag. Instead the rectangle's own DOM element is updated
+// directly, and state/render() are only touched at the start and end
+// of the whole crop session (open / confirm / cancel).
+function bindCropEvents() {
+  const stage = document.getElementById("cropStage");
+  const img = document.getElementById("cropImg");
+  const rectEl = document.getElementById("cropRect");
+  if (!stage || !img || !rectEl) return;
+
+  const MIN_SIZE = 40;
+  let rect = { x: 0, y: 0, w: 0, h: 0 };
+
+  function applyRect() {
+    rectEl.style.left = rect.x + "px";
+    rectEl.style.top = rect.y + "px";
+    rectEl.style.width = rect.w + "px";
+    rectEl.style.height = rect.h + "px";
+  }
+
+  function initRect() {
+    const stageW = stage.clientWidth;
+    const stageH = stage.clientHeight;
+    // Start inset ~8% from each edge rather than the full photo — on
+    // all four example stickers the sticker itself sits well inside
+    // the photo's outer border, so this default usually needs only a
+    // small nudge instead of a drag from a corner-sized starting box.
+    const insetX = stageW * 0.08;
+    const insetY = stageH * 0.08;
+    rect = { x: insetX, y: insetY, w: stageW - insetX * 2, h: stageH - insetY * 2 };
+    applyRect();
+  }
+
+  if (img.complete && img.naturalWidth) initRect();
+  else img.addEventListener("load", initRect, { once: true });
+
+  function clamp(r) {
+    const stageW = stage.clientWidth;
+    const stageH = stage.clientHeight;
+    r.w = Math.max(MIN_SIZE, Math.min(r.w, stageW));
+    r.h = Math.max(MIN_SIZE, Math.min(r.h, stageH));
+    r.x = Math.max(0, Math.min(r.x, stageW - r.w));
+    r.y = Math.max(0, Math.min(r.y, stageH - r.h));
+    return r;
+  }
+
+  let dragMode = null; // 'move' | 'nw' | 'ne' | 'sw' | 'se'
+  let startPointer = { x: 0, y: 0 };
+  let startRect = null;
+
+  function beginDrag(mode) {
+    return (e) => {
+      dragMode = mode;
+      startPointer = { x: e.clientX, y: e.clientY };
+      startRect = { ...rect };
+      if (e.target.setPointerCapture) e.target.setPointerCapture(e.pointerId);
+      e.preventDefault();
+      e.stopPropagation();
+    };
+  }
+
+  function onPointerMove(e) {
+    if (!dragMode) return;
+    const dx = e.clientX - startPointer.x;
+    const dy = e.clientY - startPointer.y;
+    const r = { ...startRect };
+    if (dragMode === "move") {
+      r.x = startRect.x + dx;
+      r.y = startRect.y + dy;
+    } else {
+      if (dragMode.includes("n")) { r.y = startRect.y + dy; r.h = startRect.h - dy; }
+      if (dragMode.includes("s")) { r.h = startRect.h + dy; }
+      if (dragMode.includes("w")) { r.x = startRect.x + dx; r.w = startRect.w - dx; }
+      if (dragMode.includes("e")) { r.w = startRect.w + dx; }
+    }
+    rect = clamp(r);
+    applyRect();
+  }
+
+  function onPointerUp() {
+    dragMode = null;
+  }
+
+  rectEl.addEventListener("pointerdown", beginDrag("move"));
+  rectEl.querySelectorAll(".crop-handle").forEach((h) =>
+    h.addEventListener("pointerdown", beginDrag(h.dataset.handle))
+  );
+  stage.addEventListener("pointermove", onPointerMove);
+  stage.addEventListener("pointerup", onPointerUp);
+  stage.addEventListener("pointercancel", onPointerUp);
+
+  const useCropBtn = document.getElementById("useCropBtn");
+  if (useCropBtn) useCropBtn.addEventListener("click", () => confirmCrop(rect, img, stage));
+
+  const useFullPhotoBtn = document.getElementById("useFullPhotoBtn");
+  if (useFullPhotoBtn) useFullPhotoBtn.addEventListener("click", () => {
+    const { file } = state.cropSource;
+    closeCropSession();
+    render();
+    runOcrAndApply(file);
+  });
+
+  const cancelCropBtn = document.getElementById("cancelCropBtn");
+  if (cancelCropBtn) cancelCropBtn.addEventListener("click", () => {
+    closeCropSession();
+    render();
+  });
+}
+
+// Cuts the selected rectangle out of the ORIGINAL photo at full
+// resolution (not the on-screen scaled-down display size) by scaling
+// the displayed rect back up using the ratio between the image's
+// natural size and its displayed size, then drawing just that region
+// onto an offscreen canvas. The resulting Blob is what actually gets
+// handed to Tesseract — the full original photo never does.
+function confirmCrop(rect, img, stage) {
+  const { file } = state.cropSource;
+  const scaleX = img.naturalWidth / stage.clientWidth;
+  const scaleY = img.naturalHeight / stage.clientHeight;
+  const sx = Math.round(rect.x * scaleX);
+  const sy = Math.round(rect.y * scaleY);
+  const sw = Math.round(rect.w * scaleX);
+  const sh = Math.round(rect.h * scaleY);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = sw;
+  canvas.height = sh;
+  canvas.getContext("2d").drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+
+  canvas.toBlob((blob) => {
+    closeCropSession();
+    render();
+    runOcrAndApply(blob || file); // fall back to the uncropped photo if toBlob ever fails
+  }, "image/jpeg", 0.92);
 }
 
 // Lines that are almost certainly NOT the patient name, used to filter
@@ -352,11 +545,21 @@ function parseOcrText(text, words) {
     }
   }
 
-  // MRN: look for "MRN" / "Med Rec" / "Account" / "ID" followed by digits
-  // or alphanumerics. Falls back to any standalone 6-10 digit run
-  // elsewhere on the sticker (common when the MRN sits under a barcode
-  // with no text label at all), skipping the digits already used as DOB.
-  const mrnMatch = text.match(/(?:MRN|Med(?:ical)?\s*Rec(?:ord)?\s*(?:No\.?|#|Number)?|Acct\.?\s*#?|Account\s*(?:No\.?|#)?|Patient\s*ID|ID\s*#)\s*[:\-]?\s*([A-Z0-9\-]{4,15})/i);
+  // MRN: "MRN" and "Account"/"Acct" are NOT interchangeable — a face
+  // sheet routinely prints both, as two DIFFERENT numbers (the medical
+  // record number vs. the encounter/billing account number). Matching
+  // them with one regex meant whichever label happened to appear first
+  // in reading order won, even when it was the wrong one. So: try
+  // "MRN" (tolerating "MIRN" — OCR inserting a stray letter into a
+  // short all-caps label, the same kind of noise "BD" -> "8D" was)
+  // and "Med Rec" FIRST, and only fall back to "Account"/"Acct"/"ID"
+  // if no MRN-specific label was found anywhere at all. Below that,
+  // fall back to any standalone 6-10 digit run elsewhere on the
+  // sticker (common when the MRN sits under a barcode with no text
+  // label at all), skipping the digits already used as DOB.
+  const mrnMatch =
+    text.match(/(?:MRN|M\.?I?\.?RN|Med(?:ical)?\s*Rec(?:ord)?\s*(?:No\.?|#|Number)?)\s*[:\-]?\s*([A-Z0-9\-]{4,15})/i) ||
+    text.match(/(?:Acct\.?\s*#?|Account\s*(?:No\.?|#)?|Patient\s*ID|ID\s*#)\s*[:\-]?\s*([A-Z0-9\-]{4,15})/i);
   if (mrnMatch) {
     result.mrn = mrnMatch[1];
     if (avgConfidence(mrnMatch[1]) < 70) result.lowConfidenceFields.push("mrn");
@@ -381,6 +584,7 @@ function parseOcrText(text, words) {
   const patientHeaderIdx = lines.findIndex((l) => /^PATIENT\b/i.test(l));
 
   let nameGuess = null;
+  let nameFromExplicitLabel = false;
   for (const m of text.matchAll(/(?:Patient(?:\s*Name)?|Name)\s*[:\-]\s*([A-Za-z,'.\- ]{3,40})/gi)) {
     // Check a bit of text before the label too, not just the match
     // itself — "Guarantor Name:" and "Emergency Contact Name:" don't
@@ -389,6 +593,7 @@ function parseOcrText(text, words) {
     const context = text.slice(Math.max(0, m.index - 25), m.index + m[0].length);
     if (NAME_DISQUALIFY_CONTEXT.test(context)) continue;
     nameGuess = m[1].trim();
+    nameFromExplicitLabel = true;
     break;
   }
 
@@ -398,22 +603,30 @@ function parseOcrText(text, words) {
     // commonly sits before the name on the same OCR line rather than
     // on a line of its own) and keep the best one: skip a whole line
     // when its own text names a non-patient role, and also pull in the
-    // line before it as context ONLY when that previous line has no
-    // comma of its own (i.e. looks like a bare label such as
-    // "Referring" with its value on the next line) — otherwise a
-    // disqualifying line like "Attn: Paulk, MD, Nicholas, J" would
-    // wrongly disqualify the unrelated line right after it, which is
-    // often the real patient name. Also skip a pair whose captured
-    // "first name" is actually a credential (e.g. "PAULK, MD,
-    // NICHOLAS, J"). When the sheet has a "PATIENT" section header,
-    // prefer a candidate found at or after it over one found above it
-    // (e.g. a guarantor/referring line higher up the page); otherwise
-    // take the first clean candidate found, in reading order.
+    // line before it as context ONLY when that previous line ITSELF
+    // ends with one of those role words (optionally followed by a
+    // colon) — a label that got flattened onto the tail of the
+    // previous line by OCR, with its value continuing on this line
+    // (e.g. "...Salt Lake City, Utah Guarantor:" / next line
+    // "OLLERTON, JENNIFER KAYE"). This is deliberately NOT "does the
+    // previous line contain a comma at all" — an address line like
+    // "Salt Lake City, Utah Guarantor:" has its own unrelated comma,
+    // and a line like "Attn: Paulk, MD, Nicholas, J" already carries
+    // its own value, so pulling either of those wholesale into the
+    // NEXT line's context would wrongly disqualify an unrelated real
+    // patient name sitting right after them. Also skip a pair whose
+    // captured "first name" is actually a credential (e.g. "PAULK,
+    // MD, NICHOLAS, J"). When the sheet has a "PATIENT" section
+    // header, prefer a candidate found at or after it over one found
+    // above it (e.g. a guarantor/referring line higher up the page);
+    // otherwise take the first clean candidate found, in reading
+    // order.
+    const labelTailRe = new RegExp(NAME_DISQUALIFY_CONTEXT.source.replace(/^\\b\(/, "(") + "\\s*:?\\s*$", "i");
     let best = null;
     lines.forEach((line, i) => {
       const prevLine = lines[i - 1] || "";
-      const prevIsBareLabel = prevLine && !prevLine.includes(",");
-      const context = prevIsBareLabel ? `${prevLine} ${line}` : line;
+      const prevEndsWithLabel = labelTailRe.test(prevLine);
+      const context = prevEndsWithLabel ? `${prevLine} ${line}` : line;
       if (NAME_DISQUALIFY_CONTEXT.test(context)) return;
       for (const lf of line.matchAll(/([A-Z][A-Za-z'\-]+),\s*([A-Z][A-Za-z'\-]+)/g)) {
         if (CREDENTIAL_WORD.test(lf[2])) continue;
@@ -435,7 +648,20 @@ function parseOcrText(text, words) {
   }
   if (nameGuess) {
     result.patientName = nameGuess.replace(/\s{2,}/g, " ").trim();
-    if (avgConfidence(nameGuess) < 70) result.lowConfidenceFields.push("patientName");
+    // A name pulled from an explicit "Name:"/"Patient:" label is only
+    // flagged if the OCR read itself was shaky. A name found by the
+    // "Last, First"-shape fallback or the bare ALL-CAPS fallback has no
+    // such label to back it up — it's a structural guess, and nothing
+    // stops it from confidently matching something that ISN'T the
+    // patient at all (e.g. a crisp, clearly-legible watermark/stamp
+    // elsewhere in the photo, which Tesseract may read with high
+    // per-word confidence even though it's the wrong text entirely —
+    // confidence score alone can't catch that). So any fallback-derived
+    // guess is always flagged for review, regardless of how "confident"
+    // OCR was about the characters themselves.
+    if (!nameFromExplicitLabel || avgConfidence(nameGuess) < 70) {
+      result.lowConfidenceFields.push("patientName");
+    }
   }
 
   return result;
@@ -478,7 +704,7 @@ function render() {
   else if (state.view === "settings") body = renderSettings();
   else if (state.view === "library") body = renderLibrary();
 
-  app.innerHTML = `<div class="screen">${body}</div>${tab}${state.codePicker ? renderCodePicker() : ""}`;
+  app.innerHTML = `<div class="screen">${body}</div>${tab}${state.codePicker ? renderCodePicker() : ""}${state.cropSource ? renderCropModal() : ""}`;
   bindEvents();
 }
 
@@ -779,6 +1005,40 @@ function renderCodePicker() {
     </div>`;
 }
 
+// Shown right after a photo is picked/taken, before OCR ever sees it —
+// lets the user drag a crop box down to just the sticker/face sheet so
+// stray text nearby (a watermark, another patient's sticker on the
+// same sheet, a monitor showing a different chart) can't confuse the
+// scan the way it did with the two example photos that had this issue.
+// "Use full photo" skips straight to OCR on the original image for
+// when a photo is already tightly framed.
+function renderCropModal() {
+  const { url } = state.cropSource;
+  return `
+    <div class="modal-backdrop">
+      <div class="crop-modal" data-stop="1">
+        <div class="crop-header">
+          <h2>Crop to just the sticker</h2>
+          <p class="crop-hint">Drag the corners to trim out anything that isn't the patient sticker or face sheet — this keeps stray text nearby from confusing the scan.</p>
+        </div>
+        <div id="cropStage" class="crop-stage">
+          <img id="cropImg" class="crop-image" src="${url}" alt="Captured photo" />
+          <div id="cropRect" class="crop-rect">
+            <div class="crop-handle" data-handle="nw"></div>
+            <div class="crop-handle" data-handle="ne"></div>
+            <div class="crop-handle" data-handle="sw"></div>
+            <div class="crop-handle" data-handle="se"></div>
+          </div>
+        </div>
+        <div class="crop-actions">
+          <button id="useCropBtn" class="primary-btn">Use this crop</button>
+          <button id="useFullPhotoBtn" class="secondary-btn">Use full photo</button>
+          <button id="cancelCropBtn" class="secondary-btn">Cancel</button>
+        </div>
+      </div>
+    </div>`;
+}
+
 // ---------------------------------------------------------------------
 // Event binding
 // ---------------------------------------------------------------------
@@ -797,30 +1057,19 @@ function bindEvents() {
   if (state.view === "settings") bindSettingsEvents();
   if (state.view === "library") bindLibraryEvents();
   if (state.codePicker) bindPickerEvents();
+  if (state.cropSource) bindCropEvents();
 }
 
 function bindCaptureEvents() {
   const d = state.draft;
   const camInput = document.getElementById("camInput");
   if (camInput) {
-    camInput.addEventListener("change", async (e) => {
+    camInput.addEventListener("change", (e) => {
       const file = e.target.files[0];
+      // Reset so picking the exact same file again still fires "change".
+      e.target.value = "";
       if (!file) return;
-      try {
-        const extracted = await runOcr(file);
-        Object.assign(d, {
-          patientName: extracted.patientName || d.patientName,
-          mrn: extracted.mrn || d.mrn,
-          dob: extracted.dob || d.dob,
-          lowConfidenceFields: extracted.lowConfidenceFields,
-          rawOcrText: extracted.rawText || "",
-        });
-        render();
-        toast("Scan complete — review highlighted fields");
-      } catch (err) {
-        console.error(err);
-        toast("OCR failed — enter details manually", true);
-      }
+      startCropSession(file);
     });
   }
 
