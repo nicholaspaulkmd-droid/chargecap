@@ -26,11 +26,48 @@ const SHEET_HEADER = [
 // Storage (IndexedDB via idb-keyval)
 // ---------------------------------------------------------------------
 
-// v6 of idb-keyval uses createStore(dbName, storeName) — a factory
-// function, not a "new Store(...)" class constructor.
-const casesStore = idbKeyval.createStore("chargecap-db", "cases");
-const metaStore = idbKeyval.createStore("chargecap-db", "meta");
-const codesStore = idbKeyval.createStore("chargecap-db", "codes");
+// idb-keyval's createStore() opens the database itself, so calling it
+// three times for three stores in the SAME database is a race: the
+// browser only runs the "create the storage areas" step once per
+// database, so only the first store to win that race actually gets
+// created — the other two silently never exist, and any transaction
+// against them throws NotFoundError. Fixed by opening the database
+// ourselves, once, creating all three object stores together in a
+// single upgrade — then wrapping each as an idb-keyval-compatible
+// store function (same shape createStore() returns, so idbKeyval.get/
+// set/entries all still work unchanged).
+//
+// DB_VERSION is bumped (from an implicit 1) so a browser that already
+// has a broken "chargecap-db" from an earlier buggy deploy re-runs the
+// upgrade and gets the missing stores created, instead of staying
+// stuck in its broken state forever.
+const DB_VERSION = 2;
+const STORE_NAMES = ["cases", "meta", "codes"];
+
+function openChargeCapDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open("chargecap-db", DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      STORE_NAMES.forEach((name) => {
+        if (!db.objectStoreNames.contains(name)) db.createObjectStore(name);
+      });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+const dbPromise = openChargeCapDB();
+
+function makeStore(storeName) {
+  return (txMode, callback) =>
+    dbPromise.then((db) => callback(db.transaction(storeName, txMode).objectStore(storeName)));
+}
+
+const casesStore = makeStore("cases");
+const metaStore = makeStore("meta");
+const codesStore = makeStore("codes");
 
 let CASES = []; // in-memory cache, source of truth is IndexedDB
 let SYNC_QUEUE = [];
