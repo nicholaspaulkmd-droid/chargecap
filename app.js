@@ -203,6 +203,7 @@ const state = {
   codePicker: null, // { type: 'cpt'|'icd10', category, search }
   editingCaseId: null,
   ocrBusy: false,
+  showRawOcr: false,
   library: { type: "cpt", category: "All", search: "", editingId: null, adding: false, formCode: "", formDesc: "", formCategory: "" },
 };
 
@@ -225,6 +226,7 @@ function newDraft() {
     createdAt: Date.now(),
     updatedAt: Date.now(),
     lowConfidenceFields: [],
+    rawOcrText: "",
   };
 }
 
@@ -246,19 +248,31 @@ async function runOcr(file) {
   try {
     const worker = await getOcrWorker();
     const { data } = await worker.recognize(file);
-    return parseOcrText(data.text, data.words || []);
+    const parsed = parseOcrText(data.text, data.words || []);
+    parsed.rawText = data.text;
+    return parsed;
   } finally {
     state.ocrBusy = false;
     render();
   }
 }
 
+// Lines that are almost certainly NOT the patient name, used to filter
+// candidate lines out of the name-guessing fallback below (hospital
+// stickers are full of other short caps-heavy lines: facility name,
+// "PATIENT LABEL", room/bed, barcode text, etc.).
+const NAME_EXCLUDE_WORDS = /\b(DOB|MRN|DATE|FACILITY|HOSPITAL|ROOM|BED|ACCOUNT|ACCT|SURGEON|PHYSICIAN|DOCTOR|ADDRESS|PHONE|ADMIT|PATIENT LABEL|CONFIDENTIAL|SPECIMEN|ALLERGY|ALLERGIES)\b/i;
+
 // Heuristic extraction of name / MRN / DOB from raw OCR text. Hospital
 // stickers and face sheets vary a lot by facility, so this looks for
 // common label patterns and common date/ID shapes rather than assuming
 // one fixed layout. Anything it can't find with confidence is left
 // blank for manual entry, and fields that DID get a hit but from a
-// low-confidence OCR read are flagged in lowConfidenceFields.
+// low-confidence OCR read are flagged in lowConfidenceFields. The raw
+// recognized text is always kept (see runOcr) so a scan that comes back
+// wrong or incomplete can be inspected on-device via the "View scanned
+// text" toggle in the Capture tab, without needing to share real
+// patient data anywhere to debug it.
 function parseOcrText(text, words) {
   const result = { patientName: "", mrn: "", dob: "", lowConfidenceFields: [] };
   const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
@@ -282,20 +296,42 @@ function parseOcrText(text, words) {
     }
   }
 
-  // MRN: look for "MRN" / "Med Rec" / "Account" followed by digits
-  const mrnMatch = text.match(/(?:MRN|Med(?:ical)?\s*Rec(?:ord)?\s*(?:No\.?|#|Number)?|Acct\.?\s*#?)\s*[:\-]?\s*([A-Z0-9\-]{4,15})/i);
+  // MRN: look for "MRN" / "Med Rec" / "Account" / "ID" followed by digits
+  // or alphanumerics. Falls back to any standalone 6-10 digit run
+  // elsewhere on the sticker (common when the MRN sits under a barcode
+  // with no text label at all), skipping the digits already used as DOB.
+  const mrnMatch = text.match(/(?:MRN|Med(?:ical)?\s*Rec(?:ord)?\s*(?:No\.?|#|Number)?|Acct\.?\s*#?|Account\s*(?:No\.?|#)?|Patient\s*ID|ID\s*#)\s*[:\-]?\s*([A-Z0-9\-]{4,15})/i);
   if (mrnMatch) {
     result.mrn = mrnMatch[1];
     if (avgConfidence(mrnMatch[1]) < 70) result.lowConfidenceFields.push("mrn");
+  } else {
+    const dobDigits = dobRaw ? dobRaw.replace(/\D/g, "") : null;
+    const bareNumber = (text.match(/\b\d{6,10}\b/g) || []).find((n) => !dobDigits || !dobDigits.includes(n));
+    if (bareNumber) {
+      result.mrn = bareNumber;
+      result.lowConfidenceFields.push("mrn"); // unlabeled guess — always flag for review
+    }
   }
 
-  // Name: look for "Patient" / "Name" label, else fall back to the first
-  // ALL-CAPS "Last, First" style line (common on hospital stickers).
+  // Name: look for "Patient" / "Name" label, else fall back to a
+  // "Last, First" line, else fall back to a plain 2-4 word ALL-CAPS
+  // line (e.g. "SMITH JOHN A") that isn't one of the known non-name
+  // labels above — common on stickers with no comma in the name.
   const nameLabelMatch = text.match(/(?:Patient(?:\s*Name)?|Name)\s*[:\-]\s*([A-Za-z,'.\- ]{3,40})/i);
   let nameGuess = nameLabelMatch && nameLabelMatch[1].trim();
   if (!nameGuess) {
     const lastFirst = lines.find((l) => /^[A-Z][A-Za-z'\-]+,\s*[A-Z][A-Za-z'\-]+/.test(l));
     if (lastFirst) nameGuess = lastFirst.match(/^[A-Z][A-Za-z'\-]+,\s*[A-Z][A-Za-z'\-]+/)[0];
+  }
+  if (!nameGuess) {
+    const capsLine = lines.find(
+      (l) =>
+        /^[A-Z][A-Z'\-]+(?:\s+[A-Z][A-Z'\-]*){1,3}$/.test(l) &&
+        l.length <= 35 &&
+        !NAME_EXCLUDE_WORDS.test(l) &&
+        !/\d/.test(l)
+    );
+    if (capsLine) nameGuess = capsLine;
   }
   if (nameGuess) {
     result.patientName = nameGuess.replace(/\s{2,}/g, " ").trim();
@@ -360,6 +396,10 @@ function renderCapture() {
           <input id="camInput" type="file" accept="image/*" capture="environment" ${state.ocrBusy ? "disabled" : ""} />
         </label>
         ${state.ocrBusy ? '<div class="spinner"></div>' : ""}
+        ${d.rawOcrText ? `
+          <button class="link-btn" data-toggle-raw-ocr="1">${state.showRawOcr ? "Hide" : "View"} scanned text</button>
+          ${state.showRawOcr ? `<pre class="raw-ocr">${escapeHtml(d.rawOcrText)}</pre>` : ""}
+        ` : ""}
       </section>
 
       <section class="card">
@@ -673,6 +713,7 @@ function bindCaptureEvents() {
           mrn: extracted.mrn || d.mrn,
           dob: extracted.dob || d.dob,
           lowConfidenceFields: extracted.lowConfidenceFields,
+          rawOcrText: extracted.rawText || "",
         });
         render();
         toast("Scan complete — review highlighted fields");
@@ -682,6 +723,12 @@ function bindCaptureEvents() {
       }
     });
   }
+
+  const toggleRawBtn = document.querySelector("[data-toggle-raw-ocr]");
+  if (toggleRawBtn) toggleRawBtn.addEventListener("click", () => {
+    state.showRawOcr = !state.showRawOcr;
+    render();
+  });
 
   ["patientName", "mrn", "dob", "dos", "surgeon", "notes"].forEach((f) => {
     const el = document.getElementById("f_" + f);
