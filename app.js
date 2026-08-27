@@ -16,11 +16,45 @@ const DEFAULT_GOOGLE_CLIENT_ID = "";
 
 const SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file";
 const SHEET_NAME = "ChargeCap Log";
+
+// Tab layout inside the single "ChargeCap Log" spreadsheet:
+//   - one tab per role (so primary/co-surgeon cases and assistant cases
+//     never mix on the same page, per how case logs get counted)
+//   - a hidden helper tab that unions both, so the tally only has to
+//     read from one place
+//   - the tally itself, entirely formula-driven so it stays live as new
+//     rows land without the app having to recompute anything
+const TAB_PRIMARY = "Primary & Co-Surgeon";
+const TAB_ASSISTANT = "Assistant";
+const TAB_ALL = "All Cases";
+const TAB_TALLY = "Monthly Tally";
+const DATA_TABS = [TAB_PRIMARY, TAB_ASSISTANT];
+const ALL_TABS = [TAB_PRIMARY, TAB_ASSISTANT, TAB_ALL, TAB_TALLY];
+
 const SHEET_HEADER = [
   "Date", "Patient", "MRN", "DOB", "Surgeon", "Role", "Modifier", "Facility",
   "Billing Status", "Billed Date", "CPT Codes", "CPT Descriptions",
-  "ICD-10 Codes", "ICD-10 Descriptions", "Notes",
+  "ICD-10 Codes", "ICD-10 Descriptions", "Notes", "Category",
 ];
+
+// Case category, used only for the monthly tally. A case counts as
+// Bariatric or EGD if ANY of its CPT codes match those lists (Bariatric
+// checked first, since a bariatric case that also includes an on-table
+// EGD should still count as bariatric) — everything else falls through
+// to General Surgery. Edit these two lists if the code sets change.
+const BARIATRIC_CPT = new Set(["43633", "43860", "43644", "43659", "43775", "43845", "43774"]);
+const EGD_CPT = new Set(["43266", "43235", "43239", "43245", "43247", "43233"]);
+
+function caseCategory(c) {
+  const codes = (c.cptCodes || []).map((x) => x.code);
+  if (codes.some((code) => BARIATRIC_CPT.has(code))) return "Bariatric";
+  if (codes.some((code) => EGD_CPT.has(code))) return "EGD";
+  return "General Surgery";
+}
+
+function tabForRole(role) {
+  return role === "assistant" ? TAB_ASSISTANT : TAB_PRIMARY;
+}
 
 // ---------------------------------------------------------------------
 // Storage (IndexedDB via idb-keyval)
@@ -861,7 +895,7 @@ function renderSettings() {
     <div class="content">
       <section class="card">
         <h2>Google Drive sync</h2>
-        <p class="muted">Cases marked "billed" append one row to a sheet called <strong>${SHEET_NAME}</strong> in your Google Drive. Data goes only to your own Google account — no other server is involved.</p>
+        <p class="muted">Every saved case backs up automatically to a spreadsheet called <strong>${SHEET_NAME}</strong> in your Google Drive — primary/co-surgeon cases on one tab, assistant cases on another, plus a Monthly Tally tab that auto-counts Bariatric/EGD/General Surgery cases per month. Data goes only to your own Google account — no other server is involved.</p>
         <div class="field">
           <label>Google OAuth Client ID</label>
           <input id="f_clientId" type="text" value="${escapeHtml(state._clientId || "")}" placeholder="xxxx.apps.googleusercontent.com" />
@@ -1117,6 +1151,10 @@ function bindCaptureEvents() {
     state.draft = null;
     state.view = "cases";
     render();
+    // Fire-and-forget: don't make the user wait on the network round
+    // trip just to see their case in the list. syncCaseToDrive queues
+    // itself silently if Drive isn't connected or the request fails.
+    syncCaseToDrive(d);
   });
 }
 
@@ -1141,8 +1179,10 @@ function bindCasesEvents() {
       c.status = c.status === "billed" ? "pending" : "billed";
       c.billedAt = c.status === "billed" ? Date.now() : null;
       await saveCase(c);
-      if (c.status === "billed") await syncCaseToDrive(c);
       render();
+      // Cases already sync on save; re-sync here just updates the
+      // existing row's Billing Status / Billed Date in place.
+      syncCaseToDrive(c);
     })
   );
 
@@ -1382,6 +1422,7 @@ function caseToRow(c) {
     c.icd10Codes.map((x) => x.code).join("; "),
     c.icd10Codes.map((x) => x.label || x.desc).join("; "),
     c.notes,
+    caseCategory(c),
   ];
 }
 
@@ -1440,32 +1481,162 @@ async function findOrCreateSheet() {
   });
   const createJson = await createRes.json();
   const sheetId = createJson.spreadsheetId;
-  await driveFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/A1:append?valueInputOption=RAW`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ values: [SHEET_HEADER] }),
-  });
   await setMeta("sheetId", sheetId);
   return sheetId;
 }
 
+// Makes sure the four tabs (Primary & Co-Surgeon, Assistant, All Cases,
+// Monthly Tally) exist with headers + formulas in place. Runs once per
+// spreadsheet (tracked via the "tabsReady" meta flag) and is safe to
+// re-run — it only adds what's missing.
+async function ensureTabs(sheetId) {
+  const ready = await getMeta("tabsReady", false);
+  if (ready) return;
+
+  const metaRes = await driveFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=sheets.properties`);
+  const metaJson = await metaRes.json();
+  const sheets = metaJson.sheets || [];
+  const existingTitles = sheets.map((s) => s.properties.title);
+  const requests = [];
+
+  if (!existingTitles.includes(TAB_PRIMARY)) {
+    // Rename Google's auto-created default tab (usually "Sheet1") to our
+    // first data tab instead of leaving an empty orphan tab behind —
+    // but only if that default tab isn't already one of ours.
+    const firstSheet = sheets[0];
+    if (firstSheet && !ALL_TABS.includes(firstSheet.properties.title)) {
+      requests.push({
+        updateSheetProperties: {
+          properties: { sheetId: firstSheet.properties.sheetId, title: TAB_PRIMARY },
+          fields: "title",
+        },
+      });
+    } else {
+      requests.push({ addSheet: { properties: { title: TAB_PRIMARY } } });
+    }
+  }
+  [TAB_ASSISTANT, TAB_ALL, TAB_TALLY].forEach((title) => {
+    if (!existingTitles.includes(title)) requests.push({ addSheet: { properties: { title } } });
+  });
+
+  if (requests.length) {
+    await driveFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ requests }),
+    });
+  }
+
+  // Header rows + the formulas that drive "All Cases" and "Monthly Tally".
+  // USER_ENTERED (not RAW) so date strings like "8/27/2026" get parsed
+  // into real Sheets dates — the tally's date-range math depends on that.
+  const allDateRange = `'${TAB_ALL}'!A2:A5000`;
+  await driveFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values:batchUpdate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      valueInputOption: "USER_ENTERED",
+      data: [
+        { range: `'${TAB_PRIMARY}'!A1:P1`, values: [SHEET_HEADER] },
+        { range: `'${TAB_ASSISTANT}'!A1:P1`, values: [SHEET_HEADER] },
+        { range: `'${TAB_ALL}'!A1:P1`, values: [SHEET_HEADER] },
+        {
+          // Stacks both role tabs into one sorted-by-date table so the
+          // tally only ever has to read from one range.
+          range: `'${TAB_ALL}'!A2`,
+          values: [[`=SORT({'${TAB_PRIMARY}'!A2:P5000;'${TAB_ASSISTANT}'!A2:P5000},1,TRUE)`]],
+        },
+        { range: `'${TAB_TALLY}'!A1:E1`, values: [["Month", "Bariatric", "EGD", "General Surgery", "Total"]] },
+        {
+          // One first-of-month row per month that actually has a case,
+          // newest formulas spill down automatically as rows are added.
+          range: `'${TAB_TALLY}'!A2`,
+          values: [[`=SORT(UNIQUE(FILTER(EOMONTH(${allDateRange},-1)+1,${allDateRange}<>"")))`]],
+        },
+        {
+          range: `'${TAB_TALLY}'!B2`,
+          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$P$2:$P$5000,"Bariatric")))`]],
+        },
+        {
+          range: `'${TAB_TALLY}'!C2`,
+          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$P$2:$P$5000,"EGD")))`]],
+        },
+        {
+          range: `'${TAB_TALLY}'!D2`,
+          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$P$2:$P$5000,"General Surgery")))`]],
+        },
+        { range: `'${TAB_TALLY}'!E2`, values: [[`=ARRAYFORMULA(IF(A2:A="","",B2:B+C2:C+D2:D))`]] },
+      ],
+    }),
+  });
+
+  await setMeta("tabsReady", true);
+}
+
+async function ensureSpreadsheet() {
+  const sheetId = await findOrCreateSheet();
+  await ensureTabs(sheetId);
+  return sheetId;
+}
+
+// Extracts the 1-based row number Sheets actually wrote to from an
+// append response's updatedRange, e.g. "'Assistant'!A5:P5" -> 5.
+function rowFromUpdatedRange(range) {
+  if (!range) return null;
+  const m = range.match(/![A-Z]+(\d+):/);
+  return m ? Number(m[1]) : null;
+}
+
 async function syncCaseToDrive(c) {
   if (!state._driveToken) {
-    SYNC_QUEUE.push(c.id);
+    if (!SYNC_QUEUE.includes(c.id)) SYNC_QUEUE.push(c.id);
     await setMeta("syncQueue", SYNC_QUEUE);
     return;
   }
   try {
-    const sheetId = await findOrCreateSheet();
-    await driveFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/A1:append?valueInputOption=RAW`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ values: [caseToRow(c)] }),
-    });
-    toast("Synced to Google Drive");
+    const sheetId = await ensureSpreadsheet();
+    const tab = tabForRole(c.role);
+    const row = caseToRow(c);
+
+    if (c._sheetSync && c._sheetSync.tab === tab && c._sheetSync.row) {
+      // Already has a row on the right tab (from an earlier save, or a
+      // billed-status change) — update it in place rather than
+      // appending a duplicate.
+      await driveFetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/'${tab}'!A${c._sheetSync.row}:P${c._sheetSync.row}?valueInputOption=USER_ENTERED`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ values: [row] }),
+        }
+      );
+    } else {
+      if (c._sheetSync && c._sheetSync.tab && c._sheetSync.row) {
+        // Role was changed after an earlier sync (e.g. edited from
+        // "assistant" to "primary") — clear the stale row on the old
+        // tab so the same case doesn't show up twice.
+        await driveFetch(
+          `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/'${c._sheetSync.tab}'!A${c._sheetSync.row}:P${c._sheetSync.row}:clear`,
+          { method: "POST" }
+        );
+      }
+      const appendRes = await driveFetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/'${tab}'!A1:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ values: [row] }),
+        }
+      );
+      const appendJson = await appendRes.json();
+      const rowNum = rowFromUpdatedRange(appendJson.updates && appendJson.updates.updatedRange);
+      c._sheetSync = { tab, row: rowNum };
+      await saveCase(c); // persist the row pointer so later edits update instead of re-appending
+    }
+    toast("Synced to Google Sheets");
   } catch (err) {
     console.error(err);
-    SYNC_QUEUE.push(c.id);
+    if (!SYNC_QUEUE.includes(c.id)) SYNC_QUEUE.push(c.id);
     await setMeta("syncQueue", SYNC_QUEUE);
     toast("Sync failed — queued, will retry", true);
   }

@@ -27,6 +27,10 @@ Claude.ai chat prototype with a real, installable app.
   the app shell works offline once it's been opened once.
 - Google Drive sync, coded and ready, but **disabled until you supply a
   Client ID** (see Phase 2 below) — everything else works without it.
+  Once connected, every saved case backs up automatically to a Google
+  Sheet split into a Primary/Co-Surgeon tab and an Assistant tab, plus
+  an auto-updating Monthly Tally of Bariatric/EGD/General Surgery case
+  counts.
 
 **Important — verify before relying on it for billing:** the CPT/ICD-10
 codes in `data.js` were transcribed from your existing Excel billing
@@ -67,22 +71,56 @@ biller text — with data stored locally on the phone.
 1. console.cloud.google.com → New Project → name it ChargeCap.
 2. APIs & Services → Library → enable **Google Drive API** and
    **Google Sheets API**.
-3. APIs & Services → Credentials → Create Credentials → OAuth client ID
+3. APIs & Services → OAuth consent screen → External → fill in the app
+   name (ChargeCap) and your email, then **Audience → Test users → Add
+   users** and add your own Google account's email. Without this step
+   sign-in fails with "Error 403: access_denied" even with a correct
+   Client ID, because the app starts in "Testing" publish status and
+   only whitelisted test users can sign in.
+4. APIs & Services → Credentials → Create Credentials → OAuth client ID
    → Application type: **Web application**.
-4. Under Authorized JavaScript origins, add your Netlify URL, e.g.
-   `https://chargecap-abc123.netlify.app`.
-5. Copy the generated Client ID (looks like
+5. Under Authorized JavaScript origins, add your Netlify URL, e.g.
+   `https://chargecap-abc123.netlify.app`. (No redirect URI needed —
+   this uses Google Identity Services' token flow, which only checks
+   the origin.)
+6. Copy the generated Client ID (looks like
    `123456-abc.apps.googleusercontent.com`).
-6. Open the app → Settings → paste it into "Google OAuth Client ID" →
+7. Open the app → Settings → paste it into "Google OAuth Client ID" →
    Save → Connect Google Drive → sign in and grant Sheets access.
 
-From then on, marking a case "billed" appends one row to a Google Sheet
-named **ChargeCap Log** that's created automatically in your Drive. If
-you're offline when you mark something billed, it queues and syncs the
-next time you're online and signed in.
+From then on, **every saved case backs up automatically** — no need to
+mark it billed first — to a spreadsheet named **ChargeCap Log** created
+automatically in your Drive, with four tabs:
+
+- **Primary & Co-Surgeon** — one row per case where your role is
+  Primary or Co-surgeon.
+- **Assistant** — one row per case where your role is Assistant.
+- **All Cases** — a hidden helper tab that just unions the two above;
+  no need to look at it directly.
+- **Monthly Tally** — auto-counts, per month, how many Bariatric / EGD /
+  General Surgery cases you logged (across both role tabs combined).
+  Bariatric and EGD are determined by CPT code (see `BARIATRIC_CPT` /
+  `EGD_CPT` near the top of `app.js` if those code lists ever need to
+  change); a case with both a bariatric and an EGD code on it counts as
+  Bariatric. Everything else counts as General Surgery. This tab is
+  entirely spreadsheet formulas — it recalculates itself as new rows
+  land, nothing in the app has to push counts to it.
+
+Editing a case and re-saving it, or toggling its billed status, updates
+that case's existing row in place rather than adding a duplicate — and
+if you change a case's role after it's already synced, the old row is
+cleared and a fresh one is added to the correct tab. If you're offline,
+syncs queue and go out the next time you're online and signed in.
 
 You can skip this phase entirely and just use CSV export / biller-text
 copy as your sync method — nothing else in the app depends on it.
+
+**Heads up on patient data:** this sends full case data — including
+patient name and MRN — to a spreadsheet in your own Google Drive. Only
+your Google account can see it (no other server is involved), but it's
+worth being deliberate about who has access to that Drive account and
+whether your practice's policies are fine with PHI living in Google
+Sheets before you turn this on.
 
 ## Local testing before you deploy
 
