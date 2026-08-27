@@ -263,6 +263,28 @@ async function runOcr(file) {
 // "PATIENT LABEL", room/bed, barcode text, etc.).
 const NAME_EXCLUDE_WORDS = /\b(DOB|MRN|DATE|FACILITY|HOSPITAL|ROOM|BED|ACCOUNT|ACCT|SURGEON|PHYSICIAN|DOCTOR|ADDRESS|PHONE|ADMIT|PATIENT LABEL|CONFIDENTIAL|SPECIMEN|ALLERGY|ALLERGIES)\b/i;
 
+// Face sheets and stickers routinely carry OTHER "Last, First"-shaped
+// names beside the patient's — a guarantor, an emergency contact, the
+// admitting/referring/attending physician — and any of those can look
+// exactly like a plain patient name once OCR flattens the layout to
+// text. This checks the matched line and the line right before it
+// (OCR often splits a table's label onto its own line from the value
+// beside it) for a role that disqualifies the match.
+const NAME_DISQUALIFY_CONTEXT = /\b(GUARANTOR|GUARDIAN|RESPONSIBLE\s*PART(?:Y|IES)|EMERGENCY\s*CONTACT|NEXT\s*OF\s*KIN|INSURED|SUBSCRIBER|POLICY\s*HOLDER|ATTN|ATTENDING|ADMITTING|REFERRING|SURGEON|PHYSICIAN|PROVIDER|DOCTOR)\b/i;
+
+// Some stickers print the attending physician as "LAST, MD, FIRST, M"
+// (e.g. "PAULK, MD, NICHOLAS, J") — a credential sitting where a first
+// name would in a plain "Last, First" match. Reject those.
+const CREDENTIAL_WORD = /^(MD|DO|PA|PA-C|NP|DPM|RN|CRNA|PHD)$/i;
+
+// Dates on a face sheet that are NOT the birthdate — encounter date,
+// date of service, admission/discharge, etc. — checked around a date
+// match when no recognized birth-date label was found at all, so the
+// generic "any date on the page" fallback below doesn't just grab
+// whichever date happens to print first (often the encounter date at
+// the very top of the sheet).
+const DOB_DISQUALIFY_CONTEXT = /\b(ENCOUNTER|SERVICE|ADMIT|ADMISSION|DISCHARGE|SURGERY|VISIT|DOS|CREATED|PRINTED|COLLECTED|SIGNED)\b/i;
+
 // Heuristic extraction of name / MRN / DOB from raw OCR text. Hospital
 // stickers and face sheets vary a lot by facility, so this looks for
 // common label patterns and common date/ID shapes rather than assuming
@@ -284,10 +306,44 @@ function parseOcrText(text, words) {
     return hits.reduce((s, w) => s + (w.confidence || 0), 0) / hits.length;
   };
 
-  // DOB / DOS: look for MM/DD/YYYY or MM-DD-YYYY patterns near "DOB"/"Birth"
-  const dobLabelMatch = text.match(/(?:DOB|D\.?O\.?B\.?|Birth\s*Date)\s*[:\-]?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i);
-  const anyDateMatch = text.match(/\b(\d{1,2}[\/\-]\d{1,2}[\/\-](?:19|20)\d{2})\b/);
-  const dobRaw = (dobLabelMatch && dobLabelMatch[1]) || (anyDateMatch && anyDateMatch[1]);
+  // DOB: three passes, most reliable first.
+  //
+  // 1. A date sharing a line with an age marker — "BD 7/6/1980 (44
+  //    yrs)", "Male, 72 y.o., 3/14/1954" — since that pairing only
+  //    ever describes a birthdate. This is checked FIRST and matched
+  //    by shape rather than by label text on purpose: OCR frequently
+  //    misreads short all-caps labels (this exact sheet reads "BD" as
+  //    "8D" — B/8 is a very common OCR confusion), so anchoring to the
+  //    label alone silently loses the read even when the date and age
+  //    right next to it came through fine.
+  // 2. Failing that, a recognized birth-date label (DOB / D.O.B. /
+  //    Birth Date / BD / Born) — covers sheets with no age shown.
+  // 3. Failing that, scan every date on the page and skip ones sitting
+  //    next to an obviously different date field (encounter/service/
+  //    admission/DOS/discharge, etc.) rather than just grabbing
+  //    whichever date happens to appear first (often an encounter date
+  //    up top).
+  const AGE_MARKER_RE = /\b\d{1,2}\s*(?:yrs?\.?|y\.?o\.?|years?\s*old|years?)\b/i;
+  const DATE_RE = /\b(\d{1,2}[\/\-]\d{1,2}[\/\-](?:19|20)\d{2})\b/;
+
+  let dobRaw = null;
+  for (const line of lines) {
+    if (!AGE_MARKER_RE.test(line)) continue;
+    const dm = line.match(DATE_RE);
+    if (dm) { dobRaw = dm[1]; break; }
+  }
+  if (!dobRaw) {
+    const dobLabelMatch = text.match(/(?:DOB|D\.?O\.?B\.?|Birth\s*Date|\bBD\b|\bBorn\b)\s*[:\-]?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})/i);
+    dobRaw = dobLabelMatch && dobLabelMatch[1];
+  }
+  if (!dobRaw) {
+    for (const m of text.matchAll(/\b(\d{1,2}[\/\-]\d{1,2}[\/\-](?:19|20)\d{2})\b/g)) {
+      const context = text.slice(Math.max(0, m.index - 20), m.index);
+      if (DOB_DISQUALIFY_CONTEXT.test(context)) continue;
+      dobRaw = m[1];
+      break;
+    }
+  }
   if (dobRaw) {
     const norm = normalizeDate(dobRaw);
     if (norm) {
@@ -313,15 +369,59 @@ function parseOcrText(text, words) {
     }
   }
 
-  // Name: look for "Patient" / "Name" label, else fall back to a
-  // "Last, First" line, else fall back to a plain 2-4 word ALL-CAPS
-  // line (e.g. "SMITH JOHN A") that isn't one of the known non-name
-  // labels above — common on stickers with no comma in the name.
-  const nameLabelMatch = text.match(/(?:Patient(?:\s*Name)?|Name)\s*[:\-]\s*([A-Za-z,'.\- ]{3,40})/i);
-  let nameGuess = nameLabelMatch && nameLabelMatch[1].trim();
+  // Name: look for a "Patient"/"Name" LABEL first (most reliable when
+  // present), then fall back to scanning every "Last, First"-shaped
+  // line for the best patient candidate, then finally a plain 2-4 word
+  // ALL-CAPS line (e.g. "SMITH JOHN A") that isn't one of the known
+  // non-name labels above — common on stickers with no comma in the
+  // name. Both the label search and the line scan skip anything tied
+  // to a guarantor/contact/physician role (see NAME_DISQUALIFY_CONTEXT)
+  // instead of just taking the first match in reading order, since
+  // that role's name often appears ABOVE the patient's on a face sheet.
+  const patientHeaderIdx = lines.findIndex((l) => /^PATIENT\b/i.test(l));
+
+  let nameGuess = null;
+  for (const m of text.matchAll(/(?:Patient(?:\s*Name)?|Name)\s*[:\-]\s*([A-Za-z,'.\- ]{3,40})/gi)) {
+    // Check a bit of text before the label too, not just the match
+    // itself — "Guarantor Name:" and "Emergency Contact Name:" don't
+    // contain "Patient"/"Name" at their start, so the match alone
+    // would miss the disqualifying word in front of it.
+    const context = text.slice(Math.max(0, m.index - 25), m.index + m[0].length);
+    if (NAME_DISQUALIFY_CONTEXT.test(context)) continue;
+    nameGuess = m[1].trim();
+    break;
+  }
+
   if (!nameGuess) {
-    const lastFirst = lines.find((l) => /^[A-Z][A-Za-z'\-]+,\s*[A-Z][A-Za-z'\-]+/.test(l));
-    if (lastFirst) nameGuess = lastFirst.match(/^[A-Z][A-Za-z'\-]+,\s*[A-Z][A-Za-z'\-]+/)[0];
+    // Score every clean "Last, First" pair found ANYWHERE in each line
+    // (not just at the start — a label like "Name" or "Referring"
+    // commonly sits before the name on the same OCR line rather than
+    // on a line of its own) and keep the best one: skip a whole line
+    // when its own text names a non-patient role, and also pull in the
+    // line before it as context ONLY when that previous line has no
+    // comma of its own (i.e. looks like a bare label such as
+    // "Referring" with its value on the next line) — otherwise a
+    // disqualifying line like "Attn: Paulk, MD, Nicholas, J" would
+    // wrongly disqualify the unrelated line right after it, which is
+    // often the real patient name. Also skip a pair whose captured
+    // "first name" is actually a credential (e.g. "PAULK, MD,
+    // NICHOLAS, J"). When the sheet has a "PATIENT" section header,
+    // prefer a candidate found at or after it over one found above it
+    // (e.g. a guarantor/referring line higher up the page); otherwise
+    // take the first clean candidate found, in reading order.
+    let best = null;
+    lines.forEach((line, i) => {
+      const prevLine = lines[i - 1] || "";
+      const prevIsBareLabel = prevLine && !prevLine.includes(",");
+      const context = prevIsBareLabel ? `${prevLine} ${line}` : line;
+      if (NAME_DISQUALIFY_CONTEXT.test(context)) return;
+      for (const lf of line.matchAll(/([A-Z][A-Za-z'\-]+),\s*([A-Z][A-Za-z'\-]+)/g)) {
+        if (CREDENTIAL_WORD.test(lf[2])) continue;
+        const score = patientHeaderIdx >= 0 && i < patientHeaderIdx ? 1 : 0;
+        if (!best || score < best.score) best = { text: lf[0], score };
+      }
+    });
+    if (best) nameGuess = best.text;
   }
   if (!nameGuess) {
     const capsLine = lines.find(
