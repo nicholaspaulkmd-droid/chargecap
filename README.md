@@ -9,9 +9,18 @@ Claude.ai chat prototype with a real, installable app.
 - Full UI: capture flow (OCR sticker scan → patient info → role/modifier →
   CPT codes → ICD-10 codes → notes), case list with All/Pending/Billed
   filters and search, settings panel.
+- "Scan patient sticker" opens a live in-page camera preview (not the
+  phone's own camera app) with an on-screen guide box — align the
+  sticker in the box and it auto-captures once the feed looks sharp and
+  steady for about a second, then crops to exactly that box before
+  handing off to OCR. A "Capture now" button skips the wait, and "Use
+  camera app instead" falls back to the old tap-and-shoot flow (which
+  also kicks in automatically if the browser can't do live camera
+  access, or camera permission is denied).
 - On-device OCR via Tesseract.js — no server involved, extracts patient
   name / MRN / DOB with a confidence-based yellow highlight on fields
-  worth double-checking.
+  worth double-checking. Parsing targets patient ID stickers
+  specifically (not general face sheets).
 - CPT and ICD-10 favorite libraries pulled directly from your OR billing
   sheets (`Billing Sheet - OR.xlsx` and `Billing Sheet - 11.04.22.xlsx`),
   organized by the categories from the spec (Bariatric, Revision, Hernia,
@@ -29,8 +38,8 @@ Claude.ai chat prototype with a real, installable app.
   Client ID** (see Phase 2 below) — everything else works without it.
   Once connected, every saved case backs up automatically to a Google
   Sheet split into a Primary/Co-Surgeon tab and an Assistant tab, plus
-  an auto-updating Monthly Tally of Bariatric/EGD/General Surgery case
-  counts.
+  an auto-updating Monthly Tally of Bariatric/EGD/Back/General Surgery/
+  Tummy Tuck case counts.
 
 **Important — verify before relying on it for billing:** the CPT/ICD-10
 codes in `data.js` were transcribed from your existing Excel billing
@@ -98,13 +107,19 @@ automatically in your Drive, with four tabs:
 - **All Cases** — a hidden helper tab that just unions the two above;
   no need to look at it directly.
 - **Monthly Tally** — auto-counts, per month, how many Bariatric / EGD /
-  General Surgery cases you logged (across both role tabs combined).
-  Bariatric and EGD are determined by CPT code (see `BARIATRIC_CPT` /
-  `EGD_CPT` near the top of `app.js` if those code lists ever need to
-  change); a case with both a bariatric and an EGD code on it counts as
-  Bariatric. Everything else counts as General Surgery. This tab is
-  entirely spreadsheet formulas — it recalculates itself as new rows
-  land, nothing in the app has to push counts to it.
+  Back / General Surgery cases you logged (across both role tabs
+  combined). Each is determined by CPT code (see `BARIATRIC_CPT` /
+  `EGD_CPT` / `BACK_CPT` near the top of `app.js` if those code lists
+  ever need to change); checked in that order, so a case matching more
+  than one list only counts once, under the first one it matches (e.g.
+  a bariatric case that also has an on-table EGD code still counts as
+  Bariatric — `BACK_CPT` currently covers 22558/22585). Everything else
+  counts as General Surgery. This tab is entirely spreadsheet formulas
+  — it recalculates itself as new rows land, nothing in the app has to
+  push counts to it. If you already connected Drive before this change,
+  the next case you save will automatically add the Back column and
+  reshuffle the tally formulas into place — no manual spreadsheet
+  editing needed.
 
 Editing a case and re-saving it, or toggling its billed status, updates
 that case's existing row in place rather than adding a duplicate — and

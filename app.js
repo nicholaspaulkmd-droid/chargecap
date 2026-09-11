@@ -38,17 +38,28 @@ const SHEET_HEADER = [
 ];
 
 // Case category, used only for the monthly tally. A case counts as
-// Bariatric or EGD if ANY of its CPT codes match those lists (Bariatric
-// checked first, since a bariatric case that also includes an on-table
-// EGD should still count as bariatric) — everything else falls through
-// to General Surgery. Edit these two lists if the code sets change.
+// Bariatric, EGD, or Back if ANY of its CPT codes match that list —
+// checked in this order (Bariatric, then EGD, then Back), so a case
+// with codes from more than one list still only counts once, under
+// the first list it matches (e.g. a bariatric case that also includes
+// an on-table EGD still counts as bariatric). Everything else falls
+// through to General Surgery. Edit these lists if the code sets change.
 const BARIATRIC_CPT = new Set(["43633", "43860", "43644", "43659", "43775", "43845", "43774"]);
 const EGD_CPT = new Set(["43266", "43235", "43239", "43245", "43247", "43233"]);
+const BACK_CPT = new Set(["22558", "22585"]);
+const TUMMY_TUCK_CPT = new Set(["15830", "15847"]);
 
 function caseCategory(c) {
-  const codes = (c.cptCodes || []).map((x) => x.code);
+  // Normalize with .trim() — CPT entries transcribed from the source
+  // Excel sheets have had stray whitespace before, and a bare string
+  // mismatch here silently falls through to "General Surgery" with no
+  // error, which is exactly the kind of miscategorization this
+  // function exists to avoid.
+  const codes = (c.cptCodes || []).map((x) => (x.code || "").trim());
   if (codes.some((code) => BARIATRIC_CPT.has(code))) return "Bariatric";
   if (codes.some((code) => EGD_CPT.has(code))) return "EGD";
+  if (codes.some((code) => BACK_CPT.has(code))) return "Back";
+  if (codes.some((code) => TUMMY_TUCK_CPT.has(code))) return "Tummy Tuck";
   return "General Surgery";
 }
 
@@ -236,6 +247,7 @@ const state = {
   casesSearch: "",
   codePicker: null, // { type: 'cpt'|'icd10', category, search }
   cropSource: null, // { file, url, naturalWidth, naturalHeight } — set while the crop-before-scan screen is open
+  liveScanOpen: false, // true while the live auto-capture camera screen is open (see "Live auto-capture scan" below)
   editingCaseId: null,
   ocrBusy: false,
   showRawOcr: false,
@@ -484,39 +496,279 @@ function confirmCrop(rect, img, stage) {
   }, "image/jpeg", 0.92);
 }
 
+// ---------------------------------------------------------------------
+// Live auto-capture scan
+// ---------------------------------------------------------------------
+//
+// "Scan patient sticker" opens an in-page live camera preview instead of
+// handing off to the phone's own camera app, so the app can watch the
+// feed and snap the photo itself once a sticker looks steadily in view.
+// IMPORTANT CONSTRAINT: a web page has no access to the phone camera's
+// real autofocus signal — capture="environment" file inputs (used
+// elsewhere as the fallback) hand back a finished photo with no camera
+// state at all, and even a live getUserMedia stream doesn't expose
+// "focus locked." So "auto-capture on focus" here is approximated with
+// a cheap on-device heuristic: sample the region inside the on-screen
+// guide box a few times a second, and once it reads as both sharp
+// (in-focus-looking, via a simple gradient/edge-energy measure) and
+// steady (not moving, via frame-to-frame pixel difference) for about
+// a second, treat that as "good enough" and capture. The auto-crop is
+// simply "whatever the guide box was framing" — since the user is
+// looking at a live preview and can visually fit the sticker into that
+// box before it fires, this is far more reliable than trying to detect
+// the sticker's actual edges after the fact (which would need real
+// computer-vision segmentation this app doesn't have).
+//
+// `liveScan` is deliberately kept OUTSIDE `state`/render() while a scan
+// is running — same reasoning as the crop-drag rectangle above: nothing
+// should call render() while the camera is live, since a full
+// innerHTML rebuild would tear down the <video> element and orphan the
+// MediaStream. render() is only called to open the modal (before the
+// camera is requested), and to close it (after the stream is stopped).
+const liveScan = {
+  started: false, // guards against requesting the camera twice for one modal session
+  stream: null,
+  timer: null,
+  prevFrame: null, // Uint8ClampedArray — previous downsized grayscale sample, for the stability check
+  steadyFrames: 0,
+  capturing: false, // true once a capture has fired, to ignore further loop ticks while it wraps up
+};
+
+const SCAN_SAMPLE_W = 64; // downsized sample size used for the sharpness/stability check — kept
+const SCAN_SAMPLE_H = 32; // tiny on purpose so this can run several times a second on-device
+const SCAN_SHARPNESS_MIN = 12; // min avg pixel-to-pixel gradient to count as "in focus"-looking
+const SCAN_STABILITY_MAX = 6; // max avg frame-to-frame pixel delta to count as "steady"
+const SCAN_STEADY_TICKS_NEEDED = 6; // consecutive good checks before auto-capture fires
+const SCAN_CHECK_INTERVAL_MS = 120; // ~6 checks needed * 120ms ≈ 0.7s of steady+sharp before capture
+
+// Maps an on-screen element's rect (the guide box) to pixel coordinates
+// in the VIDEO's native resolution, accounting for `object-fit: cover`
+// (the preview fills its container and may crop/letterbox the actual
+// feed) — mirrors what confirmCrop() above does for a plain <img>, just
+// with the extra cover-vs-contain math a live video preview needs.
+function getVideoContentRect(video) {
+  const rect = video.getBoundingClientRect();
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return rect;
+  const elAspect = rect.width / rect.height;
+  const vAspect = vw / vh;
+  let contentW, contentH, offsetX, offsetY;
+  if (vAspect > elAspect) {
+    contentH = rect.height;
+    contentW = rect.height * vAspect;
+    offsetX = (rect.width - contentW) / 2;
+    offsetY = 0;
+  } else {
+    contentW = rect.width;
+    contentH = rect.width / vAspect;
+    offsetX = 0;
+    offsetY = (rect.height - contentH) / 2;
+  }
+  return { left: rect.left + offsetX, top: rect.top + offsetY, width: contentW, height: contentH };
+}
+
+function guideRectToVideoPixels(video, guideEl) {
+  const content = getVideoContentRect(video);
+  const g = guideEl.getBoundingClientRect();
+  const scaleX = video.videoWidth / content.width;
+  const scaleY = video.videoHeight / content.height;
+  const sx = Math.max(0, Math.round((g.left - content.left) * scaleX));
+  const sy = Math.max(0, Math.round((g.top - content.top) * scaleY));
+  const sw = Math.max(1, Math.min(Math.round(g.width * scaleX), video.videoWidth - sx));
+  const sh = Math.max(1, Math.min(Math.round(g.height * scaleY), video.videoHeight - sy));
+  return { sx, sy, sw, sh };
+}
+
+// Opens the live-scan modal and requests camera access. Called right
+// after the modal's first render (see bindLiveScanEvents), so the
+// <video>/guide elements already exist by the time this runs.
+async function openLiveScan() {
+  // Yield one tick before doing anything that might call render() —
+  // guarantees this never re-enters render()/bindEvents() from within
+  // the very call stack that's still finishing binding them.
+  await Promise.resolve();
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    fallbackToFilePicker("Live camera not supported on this browser — using your camera app instead");
+    return;
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      audio: false,
+    });
+    if (!state.liveScanOpen) {
+      // Modal was cancelled while the permission prompt was up.
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
+    const video = document.getElementById("liveScanVideo");
+    if (!video) {
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
+    liveScan.stream = stream;
+    video.srcObject = stream;
+    await video.play().catch(() => {});
+    startAutoCaptureLoop(video);
+  } catch (err) {
+    console.error("getUserMedia failed", err);
+    fallbackToFilePicker("Live camera unavailable — using your camera app instead");
+  }
+}
+
+function fallbackToFilePicker(message) {
+  closeLiveScan();
+  render();
+  toast(message, true);
+  const camInput = document.getElementById("camInput");
+  if (camInput) camInput.click();
+}
+
+function startAutoCaptureLoop(video) {
+  const guideEl = document.getElementById("scanGuide");
+  if (!guideEl) return;
+  const sampleCanvas = document.createElement("canvas");
+  sampleCanvas.width = SCAN_SAMPLE_W;
+  sampleCanvas.height = SCAN_SAMPLE_H;
+  const ctx = sampleCanvas.getContext("2d", { willReadFrequently: true });
+
+  liveScan.prevFrame = null;
+  liveScan.steadyFrames = 0;
+  liveScan.capturing = false;
+
+  liveScan.timer = setInterval(() => {
+    if (liveScan.capturing || !video.videoWidth) return;
+
+    const { sx, sy, sw, sh } = guideRectToVideoPixels(video, guideEl);
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, SCAN_SAMPLE_W, SCAN_SAMPLE_H);
+    const { data } = ctx.getImageData(0, 0, SCAN_SAMPLE_W, SCAN_SAMPLE_H);
+
+    const gray = new Uint8ClampedArray(SCAN_SAMPLE_W * SCAN_SAMPLE_H);
+    for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+      gray[p] = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114) | 0;
+    }
+
+    // Sharpness proxy: average horizontal pixel-to-pixel gradient. A
+    // blurry/out-of-focus sample has soft transitions everywhere; crisp
+    // text (like a sticker's printed name/MRN) has sharp ones.
+    let gradientSum = 0, gradientCount = 0;
+    for (let y = 0; y < SCAN_SAMPLE_H; y++) {
+      for (let x = 1; x < SCAN_SAMPLE_W; x++) {
+        gradientSum += Math.abs(gray[y * SCAN_SAMPLE_W + x] - gray[y * SCAN_SAMPLE_W + x - 1]);
+        gradientCount++;
+      }
+    }
+    const sharpness = gradientCount ? gradientSum / gradientCount : 0;
+
+    // Stability: average per-pixel change vs. the previous sample —
+    // low means the phone (and the sticker) held still.
+    let stability = Infinity;
+    if (liveScan.prevFrame) {
+      let diffSum = 0;
+      for (let i = 0; i < gray.length; i++) diffSum += Math.abs(gray[i] - liveScan.prevFrame[i]);
+      stability = diffSum / gray.length;
+    }
+    liveScan.prevFrame = gray;
+
+    const good = sharpness >= SCAN_SHARPNESS_MIN && stability <= SCAN_STABILITY_MAX;
+    liveScan.steadyFrames = good ? liveScan.steadyFrames + 1 : 0;
+    updateScanStatus(liveScan.steadyFrames, good);
+
+    if (liveScan.steadyFrames >= SCAN_STEADY_TICKS_NEEDED) {
+      captureLiveFrame(video, guideEl);
+    }
+  }, SCAN_CHECK_INTERVAL_MS);
+}
+
+function updateScanStatus(steadyFrames, good) {
+  const statusEl = document.getElementById("scanStatus");
+  const guideEl = document.getElementById("scanGuide");
+  if (!statusEl || !guideEl) return;
+  if (steadyFrames >= SCAN_STEADY_TICKS_NEEDED) {
+    statusEl.textContent = "Got it — capturing…";
+    guideEl.classList.add("locked");
+  } else if (good) {
+    statusEl.textContent = "Hold still…";
+    guideEl.classList.add("locked");
+  } else {
+    statusEl.textContent = "Fit the sticker in the box";
+    guideEl.classList.remove("locked");
+  }
+}
+
+// Crops the guide box's region out of the live video at full camera
+// resolution (not the on-screen preview size) and hands it to OCR —
+// the same shared runOcrAndApply() path the manual crop screen uses.
+function captureLiveFrame(video, guideEl) {
+  if (liveScan.capturing) return;
+  liveScan.capturing = true;
+  if (liveScan.timer) clearInterval(liveScan.timer);
+  const statusEl = document.getElementById("scanStatus");
+  if (statusEl) statusEl.textContent = "Captured!";
+
+  const { sx, sy, sw, sh } = guideRectToVideoPixels(video, guideEl);
+  const canvas = document.createElement("canvas");
+  canvas.width = sw;
+  canvas.height = sh;
+  canvas.getContext("2d").drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+
+  canvas.toBlob((blob) => {
+    closeLiveScan();
+    render();
+    if (blob) runOcrAndApply(blob);
+    else toast("Capture failed — try again", true);
+  }, "image/jpeg", 0.92);
+}
+
+// Stops the camera stream/analysis loop and closes the modal. Every
+// path that can end a live-scan session (Cancel, "use camera app
+// instead", a capture firing, or getUserMedia failing) goes through
+// this so the camera is never left running in the background.
+function closeLiveScan() {
+  if (liveScan.timer) clearInterval(liveScan.timer);
+  liveScan.timer = null;
+  if (liveScan.stream) liveScan.stream.getTracks().forEach((t) => t.stop());
+  liveScan.stream = null;
+  liveScan.prevFrame = null;
+  liveScan.steadyFrames = 0;
+  liveScan.capturing = false;
+  liveScan.started = false;
+  state.liveScanOpen = false;
+}
+
 // Lines that are almost certainly NOT the patient name, used to filter
 // candidate lines out of the name-guessing fallback below (hospital
 // stickers are full of other short caps-heavy lines: facility name,
 // "PATIENT LABEL", room/bed, barcode text, etc.).
 const NAME_EXCLUDE_WORDS = /\b(DOB|MRN|DATE|FACILITY|HOSPITAL|ROOM|BED|ACCOUNT|ACCT|SURGEON|PHYSICIAN|DOCTOR|ADDRESS|PHONE|ADMIT|PATIENT LABEL|CONFIDENTIAL|SPECIMEN|ALLERGY|ALLERGIES)\b/i;
 
-// Face sheets and stickers routinely carry OTHER "Last, First"-shaped
-// names beside the patient's — a guarantor, an emergency contact, the
-// admitting/referring/attending physician — and any of those can look
-// exactly like a plain patient name once OCR flattens the layout to
-// text. This checks the matched line and the line right before it
-// (OCR often splits a table's label onto its own line from the value
-// beside it) for a role that disqualifies the match.
-const NAME_DISQUALIFY_CONTEXT = /\b(GUARANTOR|GUARDIAN|RESPONSIBLE\s*PART(?:Y|IES)|EMERGENCY\s*CONTACT|NEXT\s*OF\s*KIN|INSURED|SUBSCRIBER|POLICY\s*HOLDER|ATTN|ATTENDING|ADMITTING|REFERRING|SURGEON|PHYSICIAN|PROVIDER|DOCTOR)\b/i;
+// A patient ID sticker sometimes also prints the ordering/attending
+// physician's name in the same "Last, First" shape as the patient's —
+// this disqualifies a match tied to that role so it isn't mistaken for
+// the patient. This checks the matched line and the line right before
+// it (OCR often splits a label onto its own line from the value beside
+// it) for a role word that disqualifies the match.
+const NAME_DISQUALIFY_CONTEXT = /\b(ATTENDING|ADMITTING|REFERRING|ORDERING|SURGEON|PHYSICIAN|PROVIDER|DOCTOR)\b/i;
 
 // Some stickers print the attending physician as "LAST, MD, FIRST, M"
 // (e.g. "PAULK, MD, NICHOLAS, J") — a credential sitting where a first
 // name would in a plain "Last, First" match. Reject those.
 const CREDENTIAL_WORD = /^(MD|DO|PA|PA-C|NP|DPM|RN|CRNA|PHD)$/i;
 
-// Dates on a face sheet that are NOT the birthdate — encounter date,
-// date of service, admission/discharge, etc. — checked around a date
-// match when no recognized birth-date label was found at all, so the
-// generic "any date on the page" fallback below doesn't just grab
-// whichever date happens to print first (often the encounter date at
-// the very top of the sheet).
-const DOB_DISQUALIFY_CONTEXT = /\b(ENCOUNTER|SERVICE|ADMIT|ADMISSION|DISCHARGE|SURGERY|VISIT|DOS|CREATED|PRINTED|COLLECTED|SIGNED)\b/i;
+// A date on a sticker that is NOT the birthdate — most commonly the
+// sticker's own print timestamp — checked around a date match when no
+// recognized birth-date label was found at all, so the generic "any
+// date on the sticker" fallback below doesn't just grab whichever date
+// happens to print first.
+const DOB_DISQUALIFY_CONTEXT = /\b(PRINTED|CREATED)\b/i;
 
-// Heuristic extraction of name / MRN / DOB from raw OCR text. Hospital
-// stickers and face sheets vary a lot by facility, so this looks for
-// common label patterns and common date/ID shapes rather than assuming
-// one fixed layout. Anything it can't find with confidence is left
-// blank for manual entry, and fields that DID get a hit but from a
+// Heuristic extraction of name / MRN / DOB from the raw OCR text of a
+// patient ID sticker. Sticker layouts vary a lot by facility, so this
+// looks for common label patterns and common date/ID shapes rather than
+// assuming one fixed layout. Anything it can't find with confidence is
+// left blank for manual entry, and fields that DID get a hit but from a
 // low-confidence OCR read are flagged in lowConfidenceFields. The raw
 // recognized text is always kept (see runOcr) so a scan that comes back
 // wrong or incomplete can be inspected on-device via the "View scanned
@@ -608,22 +860,19 @@ function parseOcrText(text, words) {
 
   // Name: look for a "Patient"/"Name" LABEL first (most reliable when
   // present), then fall back to scanning every "Last, First"-shaped
-  // line for the best patient candidate, then finally a plain 2-4 word
-  // ALL-CAPS line (e.g. "SMITH JOHN A") that isn't one of the known
-  // non-name labels above — common on stickers with no comma in the
-  // name. Both the label search and the line scan skip anything tied
-  // to a guarantor/contact/physician role (see NAME_DISQUALIFY_CONTEXT)
-  // instead of just taking the first match in reading order, since
-  // that role's name often appears ABOVE the patient's on a face sheet.
-  const patientHeaderIdx = lines.findIndex((l) => /^PATIENT\b/i.test(l));
-
+  // line for the first clean patient candidate, then finally a plain
+  // 2-4 word ALL-CAPS line (e.g. "SMITH JOHN A") that isn't one of the
+  // known non-name labels above — common on stickers with no comma in
+  // the name. Both the label search and the line scan skip anything
+  // tied to a physician/provider role (see NAME_DISQUALIFY_CONTEXT)
+  // instead of just taking the first match blindly, since some
+  // stickers also print the ordering/attending physician's name in the
+  // same shape.
   let nameGuess = null;
   let nameFromExplicitLabel = false;
   for (const m of text.matchAll(/(?:Patient(?:\s*Name)?|Name)\s*[:\-]\s*([A-Za-z,'.\- ]{3,40})/gi)) {
     // Check a bit of text before the label too, not just the match
-    // itself — "Guarantor Name:" and "Emergency Contact Name:" don't
-    // contain "Patient"/"Name" at their start, so the match alone
-    // would miss the disqualifying word in front of it.
+    // itself, in case a role word sits just in front of it.
     const context = text.slice(Math.max(0, m.index - 25), m.index + m[0].length);
     if (NAME_DISQUALIFY_CONTEXT.test(context)) continue;
     nameGuess = m[1].trim();
@@ -632,43 +881,31 @@ function parseOcrText(text, words) {
   }
 
   if (!nameGuess) {
-    // Score every clean "Last, First" pair found ANYWHERE in each line
-    // (not just at the start — a label like "Name" or "Referring"
+    // Scan every clean "Last, First" pair found ANYWHERE in each line
+    // (not just at the start — a label like "Name" or "Surgeon"
     // commonly sits before the name on the same OCR line rather than
-    // on a line of its own) and keep the best one: skip a whole line
-    // when its own text names a non-patient role, and also pull in the
-    // line before it as context ONLY when that previous line ITSELF
-    // ends with one of those role words (optionally followed by a
-    // colon) — a label that got flattened onto the tail of the
-    // previous line by OCR, with its value continuing on this line
-    // (e.g. "...Salt Lake City, Utah Guarantor:" / next line
-    // "OLLERTON, JENNIFER KAYE"). This is deliberately NOT "does the
-    // previous line contain a comma at all" — an address line like
-    // "Salt Lake City, Utah Guarantor:" has its own unrelated comma,
-    // and a line like "Attn: Paulk, MD, Nicholas, J" already carries
-    // its own value, so pulling either of those wholesale into the
-    // NEXT line's context would wrongly disqualify an unrelated real
-    // patient name sitting right after them. Also skip a pair whose
-    // captured "first name" is actually a credential (e.g. "PAULK,
-    // MD, NICHOLAS, J"). When the sheet has a "PATIENT" section
-    // header, prefer a candidate found at or after it over one found
-    // above it (e.g. a guarantor/referring line higher up the page);
-    // otherwise take the first clean candidate found, in reading
-    // order.
+    // on a line of its own) and take the FIRST one, in reading order:
+    // skip a whole line when its own text names a physician/provider
+    // role, and also pull in the line before it as context ONLY when
+    // that previous line ITSELF ends with one of those role words
+    // (optionally followed by a colon) — a label that got flattened
+    // onto the tail of the previous line by OCR, with its value
+    // continuing on this line (e.g. "Surgeon:" / next line "PAULK,
+    // NICHOLAS"). Also skip a pair whose captured "first name" is
+    // actually a credential (e.g. "PAULK, MD, NICHOLAS, J").
     const labelTailRe = new RegExp(NAME_DISQUALIFY_CONTEXT.source.replace(/^\\b\(/, "(") + "\\s*:?\\s*$", "i");
-    let best = null;
-    lines.forEach((line, i) => {
+    outer: for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
       const prevLine = lines[i - 1] || "";
       const prevEndsWithLabel = labelTailRe.test(prevLine);
       const context = prevEndsWithLabel ? `${prevLine} ${line}` : line;
-      if (NAME_DISQUALIFY_CONTEXT.test(context)) return;
+      if (NAME_DISQUALIFY_CONTEXT.test(context)) continue;
       for (const lf of line.matchAll(/([A-Z][A-Za-z'\-]+),\s*([A-Z][A-Za-z'\-]+)/g)) {
         if (CREDENTIAL_WORD.test(lf[2])) continue;
-        const score = patientHeaderIdx >= 0 && i < patientHeaderIdx ? 1 : 0;
-        if (!best || score < best.score) best = { text: lf[0], score };
+        nameGuess = lf[0];
+        break outer;
       }
-    });
-    if (best) nameGuess = best.text;
+    }
   }
   if (!nameGuess) {
     const capsLine = lines.find(
@@ -738,7 +975,7 @@ function render() {
   else if (state.view === "settings") body = renderSettings();
   else if (state.view === "library") body = renderLibrary();
 
-  app.innerHTML = `<div class="screen">${body}</div>${tab}${state.codePicker ? renderCodePicker() : ""}${state.cropSource ? renderCropModal() : ""}`;
+  app.innerHTML = `<div class="screen">${body}</div>${tab}${state.codePicker ? renderCodePicker() : ""}${state.cropSource ? renderCropModal() : ""}${state.liveScanOpen ? renderLiveScanModal() : ""}`;
   bindEvents();
 }
 
@@ -751,10 +988,10 @@ function renderCapture() {
     <header class="topbar"><h1>New Case</h1></header>
     <div class="content">
       <section class="card">
-        <label class="capture-btn">
-          📷 ${state.ocrBusy ? "Reading sticker…" : "Scan patient sticker / face sheet"}
-          <input id="camInput" type="file" accept="image/*" capture="environment" ${state.ocrBusy ? "disabled" : ""} />
-        </label>
+        <button type="button" id="scanBtn" class="capture-btn" ${state.ocrBusy ? "disabled" : ""}>
+          📷 ${state.ocrBusy ? "Reading sticker…" : "Scan patient sticker"}
+        </button>
+        <input id="camInput" type="file" accept="image/*" capture="environment" class="visually-hidden" ${state.ocrBusy ? "disabled" : ""} />
         ${state.ocrBusy ? '<div class="spinner"></div>' : ""}
         ${d.rawOcrText ? `
           <button class="link-btn" data-toggle-raw-ocr="1">${state.showRawOcr ? "Hide" : "View"} scanned text</button>
@@ -895,7 +1132,7 @@ function renderSettings() {
     <div class="content">
       <section class="card">
         <h2>Google Drive sync</h2>
-        <p class="muted">Every saved case backs up automatically to a spreadsheet called <strong>${SHEET_NAME}</strong> in your Google Drive — primary/co-surgeon cases on one tab, assistant cases on another, plus a Monthly Tally tab that auto-counts Bariatric/EGD/General Surgery cases per month. Data goes only to your own Google account — no other server is involved.</p>
+        <p class="muted">Every saved case backs up automatically to a spreadsheet called <strong>${SHEET_NAME}</strong> in your Google Drive — primary/co-surgeon cases on one tab, assistant cases on another, plus a Monthly Tally tab that auto-counts Bariatric/EGD/Back/General Surgery/Tummy Tuck cases per month. Data goes only to your own Google account — no other server is involved.</p>
         <div class="field">
           <label>Google OAuth Client ID</label>
           <input id="f_clientId" type="text" value="${escapeHtml(state._clientId || "")}" placeholder="xxxx.apps.googleusercontent.com" />
@@ -1040,12 +1277,12 @@ function renderCodePicker() {
 }
 
 // Shown right after a photo is picked/taken, before OCR ever sees it —
-// lets the user drag a crop box down to just the sticker/face sheet so
-// stray text nearby (a watermark, another patient's sticker on the
-// same sheet, a monitor showing a different chart) can't confuse the
-// scan the way it did with the two example photos that had this issue.
-// "Use full photo" skips straight to OCR on the original image for
-// when a photo is already tightly framed.
+// lets the user drag a crop box down to just the sticker so stray text
+// nearby (a watermark, another patient's sticker on the same sheet, a
+// monitor showing a different chart) can't confuse the scan the way it
+// did with the two example photos that had this issue. "Use full
+// photo" skips straight to OCR on the original image for when a photo
+// is already tightly framed.
 function renderCropModal() {
   const { url } = state.cropSource;
   return `
@@ -1053,7 +1290,7 @@ function renderCropModal() {
       <div class="crop-modal" data-stop="1">
         <div class="crop-header">
           <h2>Crop to just the sticker</h2>
-          <p class="crop-hint">Drag the corners to trim out anything that isn't the patient sticker or face sheet — this keeps stray text nearby from confusing the scan.</p>
+          <p class="crop-hint">Drag the corners to trim out anything that isn't the patient sticker — this keeps stray text nearby from confusing the scan.</p>
         </div>
         <div id="cropStage" class="crop-stage">
           <img id="cropImg" class="crop-image" src="${url}" alt="Captured photo" />
@@ -1073,6 +1310,32 @@ function renderCropModal() {
     </div>`;
 }
 
+// Live in-page camera preview with the auto-capture guide box — see the
+// "Live auto-capture scan" section above for how the capture and crop
+// actually happen. "Use camera app instead" is always offered alongside
+// the automatic fallback so there's a reliable manual escape hatch if
+// the live preview or auto-capture heuristic misbehaves on a given
+// phone/lighting.
+function renderLiveScanModal() {
+  return `
+    <div class="modal-backdrop scan-backdrop">
+      <div class="scan-modal" data-stop="1">
+        <div class="scan-viewport">
+          <video id="liveScanVideo" class="scan-video" autoplay playsinline muted></video>
+          <div id="scanGuide" class="scan-guide"></div>
+          <p id="scanStatus" class="scan-status">Starting camera…</p>
+        </div>
+        <div class="scan-actions">
+          <button type="button" id="scanCaptureBtn" class="primary-btn">📷 Capture now</button>
+          <div class="scan-actions-row">
+            <button type="button" id="scanUseFilePickerBtn" class="secondary-btn">Use camera app instead</button>
+            <button type="button" id="scanCancelBtn" class="secondary-btn">Cancel</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
 // ---------------------------------------------------------------------
 // Event binding
 // ---------------------------------------------------------------------
@@ -1080,6 +1343,10 @@ function renderCropModal() {
 function bindEvents() {
   app.querySelectorAll("[data-nav]").forEach((el) =>
     el.addEventListener("click", () => {
+      // Defensive: the live-scan modal is a full-screen overlay so the
+      // tab bar underneath shouldn't be reachable while it's open, but
+      // never leave a camera stream running in the background either way.
+      if (state.liveScanOpen) closeLiveScan();
       state.view = el.dataset.nav;
       state.codePicker = null;
       render();
@@ -1092,6 +1359,7 @@ function bindEvents() {
   if (state.view === "library") bindLibraryEvents();
   if (state.codePicker) bindPickerEvents();
   if (state.cropSource) bindCropEvents();
+  if (state.liveScanOpen) bindLiveScanEvents();
 }
 
 function bindCaptureEvents() {
@@ -1104,6 +1372,16 @@ function bindCaptureEvents() {
       e.target.value = "";
       if (!file) return;
       startCropSession(file);
+    });
+  }
+
+  const scanBtn = document.getElementById("scanBtn");
+  if (scanBtn) {
+    scanBtn.addEventListener("click", () => {
+      if (state.ocrBusy) return;
+      liveScan.started = false;
+      state.liveScanOpen = true;
+      render();
     });
   }
 
@@ -1156,6 +1434,45 @@ function bindCaptureEvents() {
     // itself silently if Drive isn't connected or the request fails.
     syncCaseToDrive(d);
   });
+}
+
+// Wires the live-scan modal's buttons and kicks off the actual camera
+// request — but only the first time this modal is bound. bindEvents()
+// re-runs after every render(), but nothing calls render() while a scan
+// is in progress (see the "Live auto-capture scan" section above), so
+// in practice this only ever fires once per modal session; the
+// `liveScan.started` guard just makes that explicit instead of relying
+// on it.
+function bindLiveScanEvents() {
+  const modal = document.querySelector(".scan-modal[data-stop]");
+  if (modal) modal.addEventListener("click", (e) => e.stopPropagation());
+
+  const cancelBtn = document.getElementById("scanCancelBtn");
+  if (cancelBtn) cancelBtn.addEventListener("click", () => { closeLiveScan(); render(); });
+
+  const filePickerBtn = document.getElementById("scanUseFilePickerBtn");
+  if (filePickerBtn) {
+    filePickerBtn.addEventListener("click", () => {
+      closeLiveScan();
+      render();
+      const camInput = document.getElementById("camInput");
+      if (camInput) camInput.click();
+    });
+  }
+
+  const captureBtn = document.getElementById("scanCaptureBtn");
+  if (captureBtn) {
+    captureBtn.addEventListener("click", () => {
+      const video = document.getElementById("liveScanVideo");
+      const guideEl = document.getElementById("scanGuide");
+      if (video && guideEl && video.videoWidth) captureLiveFrame(video, guideEl);
+    });
+  }
+
+  if (!liveScan.started) {
+    liveScan.started = true;
+    openLiveScan();
+  }
 }
 
 function syncSaveButton() {
@@ -1462,19 +1779,36 @@ async function driveFetch(url, opts = {}) {
   });
 }
 
+// driveFetch() only rejects on a network-level failure — a 400/403/etc.
+// HTTP response still resolves normally, so callers that don't check
+// res.ok can silently treat a failed write as a success (this is how
+// the "All Cases"/"Monthly Tally" formulas ended up never actually
+// written: the setup call failed server-side but ensureTabs() marked
+// itself done anyway and never retried). Use this wrapper for any
+// Sheets/Drive write whose success matters.
+async function driveFetchOk(url, opts = {}) {
+  const res = await driveFetch(url, opts);
+  if (!res.ok) {
+    let detail = "";
+    try { detail = JSON.stringify((await res.json()).error || {}); } catch { /* ignore */ }
+    throw new Error(`Sheets API ${res.status} on ${url.split("?")[0]}: ${detail}`);
+  }
+  return res;
+}
+
 async function findOrCreateSheet() {
   const cachedId = await getMeta("sheetId", null);
   if (cachedId) return cachedId;
 
   const q = encodeURIComponent(`name='${SHEET_NAME}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`);
-  const listRes = await driveFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)`);
+  const listRes = await driveFetchOk(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)`);
   const listJson = await listRes.json();
   if (listJson.files && listJson.files.length) {
     await setMeta("sheetId", listJson.files[0].id);
     return listJson.files[0].id;
   }
 
-  const createRes = await driveFetch("https://sheets.googleapis.com/v4/spreadsheets", {
+  const createRes = await driveFetchOk("https://sheets.googleapis.com/v4/spreadsheets", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ properties: { title: SHEET_NAME } }),
@@ -1485,15 +1819,35 @@ async function findOrCreateSheet() {
   return sheetId;
 }
 
-// Makes sure the four tabs (Primary & Co-Surgeon, Assistant, All Cases,
-// Monthly Tally) exist with headers + formulas in place. Runs once per
-// spreadsheet (tracked via the "tabsReady" meta flag) and is safe to
-// re-run — it only adds what's missing.
-async function ensureTabs(sheetId) {
-  const ready = await getMeta("tabsReady", false);
-  if (ready) return;
+// Bump whenever the tab/formula structure changes (e.g. adding a new
+// tally category) so an already-connected user's spreadsheet picks up
+// the new columns/formulas automatically on their next sync, instead of
+// staying stuck with whatever schema existed when they first connected.
+// Mirrors DB_VERSION's self-repair pattern above. "tabsReady" used to
+// store a plain `true`; comparing with >= still does the right thing
+// for a legacy `true` value (coerces to 1, which is < any bumped
+// version here) so old installs re-run this once automatically.
+//
+// v3: added the "Tummy Tuck" tally category (CPT 15830/15847) and,
+// separately, fixed a real bug from v2 — the setup calls below weren't
+// checked for failure, so a rejected write (e.g. a malformed request)
+// could still mark tabsReady done and permanently skip the "All Cases"/
+// "Monthly Tally" formulas. Bumping the version forces everyone to
+// redo this once with the fix in place.
+const TABS_SCHEMA_VERSION = 3;
 
-  const metaRes = await driveFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=sheets.properties`);
+// Makes sure the four tabs (Primary & Co-Surgeon, Assistant, All Cases,
+// Monthly Tally) exist with headers + formulas in place, and that the
+// Monthly Tally formulas match TABS_SCHEMA_VERSION. Runs once per schema
+// version (tracked via the "tabsReady" meta flag) and is safe to re-run
+// — it only adds what's missing, and every Monthly Tally cell is always
+// a live formula anyway, so overwriting them in place is harmless (see
+// TABS_SCHEMA_VERSION above).
+async function ensureTabs(sheetId) {
+  const readyVersion = await getMeta("tabsReady", 0);
+  if (readyVersion >= TABS_SCHEMA_VERSION) return;
+
+  const metaRes = await driveFetchOk(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=sheets.properties`);
   const metaJson = await metaRes.json();
   const sheets = metaJson.sheets || [];
   const existingTitles = sheets.map((s) => s.properties.title);
@@ -1520,7 +1874,7 @@ async function ensureTabs(sheetId) {
   });
 
   if (requests.length) {
-    await driveFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
+    await driveFetchOk(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ requests }),
@@ -1531,7 +1885,7 @@ async function ensureTabs(sheetId) {
   // USER_ENTERED (not RAW) so date strings like "8/27/2026" get parsed
   // into real Sheets dates — the tally's date-range math depends on that.
   const allDateRange = `'${TAB_ALL}'!A2:A5000`;
-  await driveFetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values:batchUpdate`, {
+  await driveFetchOk(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values:batchUpdate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -1546,7 +1900,10 @@ async function ensureTabs(sheetId) {
           range: `'${TAB_ALL}'!A2`,
           values: [[`=SORT({'${TAB_PRIMARY}'!A2:P5000;'${TAB_ASSISTANT}'!A2:P5000},1,TRUE)`]],
         },
-        { range: `'${TAB_TALLY}'!A1:E1`, values: [["Month", "Bariatric", "EGD", "General Surgery", "Total"]] },
+        {
+          range: `'${TAB_TALLY}'!A1:G1`,
+          values: [["Month", "Bariatric", "EGD", "Back", "General Surgery", "Tummy Tuck", "Total"]],
+        },
         {
           // One first-of-month row per month that actually has a case,
           // newest formulas spill down automatically as rows are added.
@@ -1563,14 +1920,22 @@ async function ensureTabs(sheetId) {
         },
         {
           range: `'${TAB_TALLY}'!D2`,
+          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$P$2:$P$5000,"Back")))`]],
+        },
+        {
+          range: `'${TAB_TALLY}'!E2`,
           values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$P$2:$P$5000,"General Surgery")))`]],
         },
-        { range: `'${TAB_TALLY}'!E2`, values: [[`=ARRAYFORMULA(IF(A2:A="","",B2:B+C2:C+D2:D))`]] },
+        {
+          range: `'${TAB_TALLY}'!F2`,
+          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$P$2:$P$5000,"Tummy Tuck")))`]],
+        },
+        { range: `'${TAB_TALLY}'!G2`, values: [[`=ARRAYFORMULA(IF(A2:A="","",B2:B+C2:C+D2:D+E2:E+F2:F))`]] },
       ],
     }),
   });
 
-  await setMeta("tabsReady", true);
+  await setMeta("tabsReady", TABS_SCHEMA_VERSION);
 }
 
 async function ensureSpreadsheet() {
@@ -1602,7 +1967,7 @@ async function syncCaseToDrive(c) {
       // Already has a row on the right tab (from an earlier save, or a
       // billed-status change) — update it in place rather than
       // appending a duplicate.
-      await driveFetch(
+      await driveFetchOk(
         `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/'${tab}'!A${c._sheetSync.row}:P${c._sheetSync.row}?valueInputOption=USER_ENTERED`,
         {
           method: "PUT",
@@ -1615,12 +1980,12 @@ async function syncCaseToDrive(c) {
         // Role was changed after an earlier sync (e.g. edited from
         // "assistant" to "primary") — clear the stale row on the old
         // tab so the same case doesn't show up twice.
-        await driveFetch(
+        await driveFetchOk(
           `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/'${c._sheetSync.tab}'!A${c._sheetSync.row}:P${c._sheetSync.row}:clear`,
           { method: "POST" }
         );
       }
-      const appendRes = await driveFetch(
+      const appendRes = await driveFetchOk(
         `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/'${tab}'!A1:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
         {
           method: "POST",
