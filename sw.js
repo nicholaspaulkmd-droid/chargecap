@@ -3,7 +3,7 @@
 // Bump CACHE_VERSION whenever app.js/styles.css/data.js change so clients
 // pick up the new version instead of serving a stale cache forever.
 
-const CACHE_VERSION = "chargecap-v15";
+const CACHE_VERSION = "chargecap-v16";
 const APP_SHELL = [
   "./",
   "./index.html",

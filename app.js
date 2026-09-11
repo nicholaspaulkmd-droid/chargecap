@@ -31,8 +31,13 @@ const TAB_TALLY = "Monthly Tally";
 const DATA_TABS = [TAB_PRIMARY, TAB_ASSISTANT];
 const ALL_TABS = [TAB_PRIMARY, TAB_ASSISTANT, TAB_ALL, TAB_TALLY];
 
+// "Surgeon" removed 2026-09-11 — redundant with Role (Primary/Co-surgeon/
+// Assistant already identifies who's who). Every column from Role onward
+// shifted one letter left as a result — this sheet is now 15 columns
+// (A-O, Category now in O) instead of 16 (A-P, Category was in P). See
+// the "O" column references in ensureTabs()/syncCaseToDrive() below.
 const SHEET_HEADER = [
-  "Date", "Patient", "MRN", "DOB", "Surgeon", "Role", "Modifier", "Facility",
+  "Date", "Patient", "MRN", "DOB", "Role", "Modifier", "Facility",
   "Billing Status", "Billed Date", "CPT Codes", "CPT Descriptions",
   "ICD-10 Codes", "ICD-10 Descriptions", "Notes", "Category",
 ];
@@ -261,7 +266,6 @@ function newDraft() {
     mrn: "",
     dob: "",
     dos: todayISO(),
-    surgeon: "",
     facility: FACILITIES[0],
     role: "primary",
     modifier: "",
@@ -1027,10 +1031,6 @@ function renderCapture() {
             </select>
           </div>
         </div>
-        <div class="field">
-          <label>Surgeon</label>
-          <input id="f_surgeon" type="text" value="${escapeHtml(d.surgeon)}" placeholder="e.g. Paulk" />
-        </div>
       </section>
 
       <section class="card">
@@ -1391,7 +1391,7 @@ function bindCaptureEvents() {
     render();
   });
 
-  ["patientName", "mrn", "dob", "dos", "surgeon", "notes"].forEach((f) => {
+  ["patientName", "mrn", "dob", "dos", "notes"].forEach((f) => {
     const el = document.getElementById("f_" + f);
     if (el) el.addEventListener("input", () => { d[f] = el.value; syncSaveButton(); });
   });
@@ -1706,7 +1706,7 @@ function exportBillerText() {
   const lines = pending.map((c) => {
     const cpt = c.cptCodes.map((x) => x.code + (x.modifier ? `-${x.modifier}` : "")).join(", ");
     const icd = c.icd10Codes.map((x) => x.code).join(", ");
-    return `${fmtDate(c.dos)} | ${c.patientName} | MRN ${c.mrn} | DOB ${fmtDate(c.dob)} | ${c.facility} | ${c.surgeon} (${c.role}${c.modifier ? " mod " + c.modifier : ""}) | CPT: ${cpt} | ICD-10: ${icd}${c.notes ? " | Notes: " + c.notes : ""}`;
+    return `${fmtDate(c.dos)} | ${c.patientName} | MRN ${c.mrn} | DOB ${fmtDate(c.dob)} | ${c.facility} | ${c.role}${c.modifier ? " mod " + c.modifier : ""} | CPT: ${cpt} | ICD-10: ${icd}${c.notes ? " | Notes: " + c.notes : ""}`;
   });
   const text = lines.join("\n") || "No pending cases.";
   navigator.clipboard.writeText(text).then(
@@ -1732,7 +1732,7 @@ function exportCsv(list, filename) {
 
 function caseToRow(c) {
   return [
-    fmtDate(c.dos), c.patientName, c.mrn, fmtDate(c.dob), c.surgeon, c.role, c.modifier, c.facility,
+    fmtDate(c.dos), c.patientName, c.mrn, fmtDate(c.dob), c.role, c.modifier, c.facility,
     c.status, c.billedAt ? new Date(c.billedAt).toLocaleString() : "",
     c.cptCodes.map((x) => x.code).join("; "),
     c.cptCodes.map((x) => x.label || x.desc).join("; "),
@@ -1834,7 +1834,12 @@ async function findOrCreateSheet() {
 // could still mark tabsReady done and permanently skip the "All Cases"/
 // "Monthly Tally" formulas. Bumping the version forces everyone to
 // redo this once with the fix in place.
-const TABS_SCHEMA_VERSION = 3;
+// v4: removed the "Surgeon" column (redundant with Role) — sheet is now
+// 15 columns (A-O) instead of 16 (A-P). Rewriting headers/formulas here
+// only fixes the TOP of the sheet (header row + tally); it does NOT
+// re-shift any data rows already written under the old 16-column
+// layout. Existing rows must be migrated by hand — see README.
+const TABS_SCHEMA_VERSION = 4;
 
 // Makes sure the four tabs (Primary & Co-Surgeon, Assistant, All Cases,
 // Monthly Tally) exist with headers + formulas in place, and that the
@@ -1891,14 +1896,14 @@ async function ensureTabs(sheetId) {
     body: JSON.stringify({
       valueInputOption: "USER_ENTERED",
       data: [
-        { range: `'${TAB_PRIMARY}'!A1:P1`, values: [SHEET_HEADER] },
-        { range: `'${TAB_ASSISTANT}'!A1:P1`, values: [SHEET_HEADER] },
-        { range: `'${TAB_ALL}'!A1:P1`, values: [SHEET_HEADER] },
+        { range: `'${TAB_PRIMARY}'!A1:O1`, values: [SHEET_HEADER] },
+        { range: `'${TAB_ASSISTANT}'!A1:O1`, values: [SHEET_HEADER] },
+        { range: `'${TAB_ALL}'!A1:O1`, values: [SHEET_HEADER] },
         {
           // Stacks both role tabs into one sorted-by-date table so the
           // tally only ever has to read from one range.
           range: `'${TAB_ALL}'!A2`,
-          values: [[`=SORT({'${TAB_PRIMARY}'!A2:P5000;'${TAB_ASSISTANT}'!A2:P5000},1,TRUE)`]],
+          values: [[`=SORT({'${TAB_PRIMARY}'!A2:O5000;'${TAB_ASSISTANT}'!A2:O5000},1,TRUE)`]],
         },
         {
           range: `'${TAB_TALLY}'!A1:G1`,
@@ -1912,23 +1917,23 @@ async function ensureTabs(sheetId) {
         },
         {
           range: `'${TAB_TALLY}'!B2`,
-          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$P$2:$P$5000,"Bariatric")))`]],
+          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$O$2:$O$5000,"Bariatric")))`]],
         },
         {
           range: `'${TAB_TALLY}'!C2`,
-          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$P$2:$P$5000,"EGD")))`]],
+          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$O$2:$O$5000,"EGD")))`]],
         },
         {
           range: `'${TAB_TALLY}'!D2`,
-          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$P$2:$P$5000,"Back")))`]],
+          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$O$2:$O$5000,"Back")))`]],
         },
         {
           range: `'${TAB_TALLY}'!E2`,
-          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$P$2:$P$5000,"General Surgery")))`]],
+          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$O$2:$O$5000,"General Surgery")))`]],
         },
         {
           range: `'${TAB_TALLY}'!F2`,
-          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$P$2:$P$5000,"Tummy Tuck")))`]],
+          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$O$2:$O$5000,"Tummy Tuck")))`]],
         },
         { range: `'${TAB_TALLY}'!G2`, values: [[`=ARRAYFORMULA(IF(A2:A="","",B2:B+C2:C+D2:D+E2:E+F2:F))`]] },
       ],
@@ -1968,7 +1973,7 @@ async function syncCaseToDrive(c) {
       // billed-status change) — update it in place rather than
       // appending a duplicate.
       await driveFetchOk(
-        `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/'${tab}'!A${c._sheetSync.row}:P${c._sheetSync.row}?valueInputOption=USER_ENTERED`,
+        `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/'${tab}'!A${c._sheetSync.row}:O${c._sheetSync.row}?valueInputOption=USER_ENTERED`,
         {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
@@ -1981,7 +1986,7 @@ async function syncCaseToDrive(c) {
         // "assistant" to "primary") — clear the stale row on the old
         // tab so the same case doesn't show up twice.
         await driveFetchOk(
-          `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/'${c._sheetSync.tab}'!A${c._sheetSync.row}:P${c._sheetSync.row}:clear`,
+          `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/'${c._sheetSync.tab}'!A${c._sheetSync.row}:O${c._sheetSync.row}:clear`,
           { method: "POST" }
         );
       }
