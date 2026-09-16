@@ -538,6 +538,44 @@ const liveScan = {
   capturing: false, // true once a capture has fired, to ignore further loop ticks while it wraps up
 };
 
+// iOS doesn't persist the camera-access grant for a home-screen web app
+// the way it does for a regular Safari tab, so a fresh getUserMedia()
+// call can re-trigger the "Allow Camera Access" system prompt. Fully
+// releasing the camera after every single scan (the old behavior) meant
+// that prompt reappeared for every patient, even back-to-back ones a
+// few seconds apart. Instead, closeLiveScan() now keeps a just-used
+// stream warm for CAMERA_IDLE_RELEASE_MS: openLiveScan() reuses it
+// (skipping getUserMedia entirely, so no new prompt) if the next scan
+// starts within that window, and releaseCamera() tears it down for real
+// if nothing reuses it in time, or immediately if the app is backgrounded.
+const CAMERA_IDLE_RELEASE_MS = 90000;
+let idleReleaseTimer = null;
+
+function releaseCamera() {
+  if (idleReleaseTimer) {
+    clearTimeout(idleReleaseTimer);
+    idleReleaseTimer = null;
+  }
+  if (liveScan.stream) {
+    liveScan.stream.getTracks().forEach((t) => t.stop());
+    liveScan.stream = null;
+  }
+}
+
+// Safety net: never let a warm-but-idle stream (or an actively-scanning
+// one) keep the camera running once ChargeCap is backgrounded. iOS
+// suspends it anyway, but releasing it ourselves keeps app state honest
+// and avoids relying on the OS to clean up after us.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) return;
+  if (state.liveScanOpen) {
+    closeLiveScan({ immediate: true });
+    render();
+  } else {
+    releaseCamera();
+  }
+});
+
 const SCAN_SAMPLE_W = 64; // downsized sample size used for the sharpness/stability check — kept
 const SCAN_SAMPLE_H = 32; // tiny on purpose so this can run several times a second on-device
 const SCAN_SHARPNESS_MIN = 12; // min avg pixel-to-pixel gradient to count as "in focus"-looking
@@ -591,6 +629,26 @@ async function openLiveScan() {
   // guarantees this never re-enters render()/bindEvents() from within
   // the very call stack that's still finishing binding them.
   await Promise.resolve();
+
+  // Reuse a still-live stream left warm by a recent scan (see
+  // closeLiveScan()/CAMERA_IDLE_RELEASE_MS above) instead of requesting
+  // the camera again — this is what avoids re-triggering the OS
+  // permission prompt for back-to-back patients.
+  if (liveScan.stream && liveScan.stream.getVideoTracks().some((t) => t.readyState === "live")) {
+    if (idleReleaseTimer) {
+      clearTimeout(idleReleaseTimer);
+      idleReleaseTimer = null;
+    }
+    const video = document.getElementById("liveScanVideo");
+    if (!video) {
+      releaseCamera();
+      return;
+    }
+    video.srcObject = liveScan.stream;
+    await video.play().catch(() => {});
+    startAutoCaptureLoop(video);
+    return;
+  }
 
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     fallbackToFilePicker("Live camera not supported on this browser — using your camera app instead");
@@ -726,20 +784,28 @@ function captureLiveFrame(video, guideEl) {
   }, "image/jpeg", 0.92);
 }
 
-// Stops the camera stream/analysis loop and closes the modal. Every
-// path that can end a live-scan session (Cancel, "use camera app
-// instead", a capture firing, or getUserMedia failing) goes through
-// this so the camera is never left running in the background.
-function closeLiveScan() {
+// Stops the analysis loop and closes the modal. Every path that can end
+// a live-scan session (Cancel, "use camera app instead", a capture
+// firing, or getUserMedia failing) goes through this. It does NOT stop
+// the camera stream itself by default — the stream is left warm for
+// CAMERA_IDLE_RELEASE_MS so the next scan can reuse it without a new
+// permission prompt (see openLiveScan()); pass {immediate: true} (used
+// when the app is backgrounded) to release it right away instead.
+function closeLiveScan({ immediate = false } = {}) {
   if (liveScan.timer) clearInterval(liveScan.timer);
   liveScan.timer = null;
-  if (liveScan.stream) liveScan.stream.getTracks().forEach((t) => t.stop());
-  liveScan.stream = null;
   liveScan.prevFrame = null;
   liveScan.steadyFrames = 0;
   liveScan.capturing = false;
   liveScan.started = false;
   state.liveScanOpen = false;
+
+  if (!liveScan.stream) return;
+  if (immediate) {
+    releaseCamera();
+  } else if (!idleReleaseTimer) {
+    idleReleaseTimer = setTimeout(releaseCamera, CAMERA_IDLE_RELEASE_MS);
+  }
 }
 
 // Lines that are almost certainly NOT the patient name, used to filter
@@ -979,7 +1045,18 @@ function render() {
   else if (state.view === "settings") body = renderSettings();
   else if (state.view === "library") body = renderLibrary();
 
-  app.innerHTML = `<div class="screen">${body}</div>${tab}${state.codePicker ? renderCodePicker() : ""}${state.cropSource ? renderCropModal() : ""}${state.liveScanOpen ? renderLiveScanModal() : ""}`;
+  // Shown app-wide (except on Settings, which already has its own
+  // connect control) whenever cases are stuck waiting to sync and we're
+  // not currently signed in — a silent reauth already failed by the
+  // time this shows (see ensureFreshToken), so this is the one-tap
+  // fallback instead of having to notice sync stopped and go find
+  // Settings → Connect on your own.
+  const needsReconnect = !state._driveToken && state._clientId && SYNC_QUEUE.length && state.view !== "settings";
+  const syncBanner = needsReconnect
+    ? `<div class="sync-banner" id="syncBanner">⚠️ ${SYNC_QUEUE.length} case(s) waiting to sync — tap to reconnect Google Drive</div>`
+    : "";
+
+  app.innerHTML = `<div class="screen">${syncBanner}${body}</div>${tab}${state.codePicker ? renderCodePicker() : ""}${state.cropSource ? renderCropModal() : ""}${state.liveScanOpen ? renderLiveScanModal() : ""}`;
   bindEvents();
 }
 
@@ -1352,6 +1429,9 @@ function bindEvents() {
       render();
     })
   );
+
+  const syncBannerEl = document.getElementById("syncBanner");
+  if (syncBannerEl) syncBannerEl.addEventListener("click", connectGoogleDrive);
 
   if (state.view === "capture") bindCaptureEvents();
   if (state.view === "cases") bindCasesEvents();
@@ -1749,26 +1829,128 @@ function caseToRow(c) {
 
 let tokenClient = null;
 
+// Access tokens from Google's implicit/token-client flow expire (~1hr)
+// and there's no refresh token in this browser-only flow — that's
+// inherent to the security model, not something we can change. What WAS
+// a bug: state._driveToken only ever lived in memory, never written to
+// IndexedDB, so it was lost on every app restart (and on iOS a PWA's JS
+// gets evicted from memory constantly just from backgrounding), forcing
+// a manual "Connect" in Settings far more often than the token's actual
+// 1hr lifetime should require. Fixed by persisting the token alongside
+// its expiry and restoring it on boot (see restoreDriveToken()), plus
+// attempting a silent (no-UI) reauth via prompt:"" before falling back
+// to asking the user to tap reconnect.
+let pendingTokenResolvers = [];
+let silentAttemptInFlight = false;
+
 function initGoogleAuth() {
   if (!state._clientId || !window.google) return;
   tokenClient = google.accounts.oauth2.initTokenClient({
     client_id: state._clientId,
     scope: SHEETS_SCOPE,
     callback: async (resp) => {
-      if (resp.error) { toast("Google sign-in failed", true); return; }
+      const resolvers = pendingTokenResolvers.splice(0);
+      const wasSilent = silentAttemptInFlight;
+      silentAttemptInFlight = false;
+      if (resp.error) {
+        // A silent (background) attempt failing is expected whenever
+        // there's no live Google session to reuse — that's not an error
+        // worth interrupting the user for. Only a user-initiated
+        // "Connect"/"reconnect" tap surfaces a toast on failure.
+        if (!wasSilent) toast("Google sign-in failed", true);
+        resolvers.forEach((r) => r(false));
+        return;
+      }
       state._driveToken = resp.access_token;
-      await setMeta("driveTokenExpiry", Date.now() + (resp.expires_in || 3600) * 1000);
-      toast("Google Drive connected");
+      const expiresAt = Date.now() + (resp.expires_in || 3600) * 1000;
+      await setMeta("driveToken", resp.access_token);
+      await setMeta("driveTokenExpiry", expiresAt);
+      if (!wasSilent) toast("Google Drive connected");
       render();
+      resolvers.forEach((r) => r(true));
       flushSyncQueue();
     },
   });
 }
 
-function connectGoogleDrive() {
-  if (!tokenClient) initGoogleAuth();
+// Restores a still-valid token from IndexedDB on boot so the app doesn't
+// need to re-authenticate every time it's relaunched — only once the
+// token has actually expired.
+async function restoreDriveToken() {
+  const token = await getMeta("driveToken", null);
+  const expiresAt = await getMeta("driveTokenExpiry", 0);
+  if (token && Date.now() < expiresAt - 60 * 1000) {
+    state._driveToken = token;
+  }
+}
+
+// Wraps tokenClient.requestAccessToken() in a Promise. silent:true uses
+// prompt:"" (no popup/consent UI — succeeds only if Google can reissue a
+// token without asking the user anything; fails quietly otherwise).
+function requestToken({ silent = false } = {}) {
+  return new Promise((resolve) => {
+    if (!tokenClient) { resolve(false); return; }
+    pendingTokenResolvers.push(resolve);
+    if (silent) silentAttemptInFlight = true;
+    // Silent: prompt:"" — no UI, succeeds only if Google can reissue
+    // without asking anything. Manual: no override, same as before —
+    // let Google show the minimum it needs (often just an instant
+    // account-picker tap for a previously-granted user, not a full
+    // consent screen every time).
+    tokenClient.requestAccessToken(silent ? { prompt: "" } : {});
+  });
+}
+
+// Google's GSI script (accounts.google.com/gsi/client) loads async over
+// the network — on a fresh app launch it's often not ready yet even
+// though app.js already is. Anything that needs tokenClient waits for
+// it here first instead of silently no-op'ing.
+function waitForGoogleIdentity(timeoutMs = 15000, intervalMs = 250) {
+  return new Promise((resolve) => {
+    if (window.google && window.google.accounts && window.google.accounts.oauth2) { resolve(true); return; }
+    const start = Date.now();
+    const id = setInterval(() => {
+      if (window.google && window.google.accounts && window.google.accounts.oauth2) {
+        clearInterval(id);
+        resolve(true);
+      } else if (Date.now() - start > timeoutMs) {
+        clearInterval(id);
+        resolve(false);
+      }
+    }, intervalMs);
+  });
+}
+
+// Explicit, user-initiated connect/reconnect (Settings button, sync
+// banner tap). Always shows the Google UI so it works even the very
+// first time, before any session/consent exists to reuse silently.
+async function connectGoogleDrive() {
+  if (!state._clientId) { toast("Add a Client ID first", true); return; }
+  if (!tokenClient) {
+    if (!(await waitForGoogleIdentity(5000))) {
+      toast("Google sign-in isn't ready yet — try again in a moment", true);
+      return;
+    }
+    initGoogleAuth();
+  }
   if (!tokenClient) { toast("Add a Client ID first", true); return; }
-  tokenClient.requestAccessToken();
+  requestToken({ silent: false });
+}
+
+// Called before anything that needs Drive access. Returns true if
+// state._driveToken is set and good to use — reusing the persisted
+// token when it's still valid, otherwise trying a silent reauth first
+// so most syncs never need a tap at all. Only returns false (caller
+// should queue + show the reconnect banner) when even that fails,
+// which mainly happens after ~1hr idle with no live Google session to
+// reuse, or before the very first connect.
+async function ensureFreshToken() {
+  const expiresAt = await getMeta("driveTokenExpiry", 0);
+  if (state._driveToken && Date.now() < expiresAt - 60 * 1000) return true;
+  if (!state._clientId) return false;
+  if (!tokenClient) initGoogleAuth();
+  if (!tokenClient) return false;
+  return requestToken({ silent: true });
 }
 
 async function driveFetch(url, opts = {}) {
@@ -1786,8 +1968,18 @@ async function driveFetch(url, opts = {}) {
 // written: the setup call failed server-side but ensureTabs() marked
 // itself done anyway and never retried). Use this wrapper for any
 // Sheets/Drive write whose success matters.
-async function driveFetchOk(url, opts = {}) {
+async function driveFetchOk(url, opts = {}, _retried = false) {
   const res = await driveFetch(url, opts);
+  // A stored token can go stale mid-session (revoked, or our expiry
+  // estimate was slightly optimistic) — a 401 here means Google itself
+  // rejected it, not just our local clock. Try one silent reauth + retry
+  // before giving up, so an in-progress sync recovers on its own instead
+  // of surfacing an avoidable failure.
+  if (res.status === 401 && !_retried) {
+    state._driveToken = null;
+    const refreshed = await requestToken({ silent: true });
+    if (refreshed) return driveFetchOk(url, opts, true);
+  }
   if (!res.ok) {
     let detail = "";
     try { detail = JSON.stringify((await res.json()).error || {}); } catch { /* ignore */ }
@@ -1839,7 +2031,15 @@ async function findOrCreateSheet() {
 // only fixes the TOP of the sheet (header row + tally); it does NOT
 // re-shift any data rows already written under the old 16-column
 // layout. Existing rows must be migrated by hand — see README.
-const TABS_SCHEMA_VERSION = 4;
+// v5 (2026-09-16): Monthly Tally was counting every case in "All Cases"
+// — which deliberately includes Assistant-role cases too, for the
+// combined log — so assist cases were inflating the user's own tally.
+// Monthly Tally's A2/B2:F2 formulas now read from "Primary & Co-Surgeon"
+// only. Bumping the version so an already-connected install picks up
+// the corrected formulas on next sync instead of keeping the old ones
+// (the live spreadsheet was also hand-fixed directly on 2026-09-16 —
+// this bump just makes sure a fresh ensureTabs() run agrees with it).
+const TABS_SCHEMA_VERSION = 5;
 
 // Makes sure the four tabs (Primary & Co-Surgeon, Assistant, All Cases,
 // Monthly Tally) exist with headers + formulas in place, and that the
@@ -1889,7 +2089,15 @@ async function ensureTabs(sheetId) {
   // Header rows + the formulas that drive "All Cases" and "Monthly Tally".
   // USER_ENTERED (not RAW) so date strings like "8/27/2026" get parsed
   // into real Sheets dates — the tally's date-range math depends on that.
+  //
+  // Monthly Tally counts ONLY Primary & Co-Surgeon cases — it must not
+  // read from "All Cases" (which deliberately also includes Assistant-role
+  // cases, for the full combined log view). tallyDateRange therefore
+  // points at TAB_PRIMARY, not TAB_ALL, even though TAB_ASSISTANT-role
+  // cases never appear in TAB_PRIMARY in the first place (see
+  // tabForRole()), so no separate role filter is needed on top of this.
   const allDateRange = `'${TAB_ALL}'!A2:A5000`;
+  const tallyDateRange = `'${TAB_PRIMARY}'!A2:A5000`;
   await driveFetchOk(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values:batchUpdate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -1900,8 +2108,9 @@ async function ensureTabs(sheetId) {
         { range: `'${TAB_ASSISTANT}'!A1:O1`, values: [SHEET_HEADER] },
         { range: `'${TAB_ALL}'!A1:O1`, values: [SHEET_HEADER] },
         {
-          // Stacks both role tabs into one sorted-by-date table so the
-          // tally only ever has to read from one range.
+          // Stacks both role tabs into one sorted-by-date table so
+          // there's a single combined log to look at — this tab is NOT
+          // what the tally counts from (see tallyDateRange above).
           range: `'${TAB_ALL}'!A2`,
           values: [[`=SORT({'${TAB_PRIMARY}'!A2:O5000;'${TAB_ASSISTANT}'!A2:O5000},1,TRUE)`]],
         },
@@ -1910,30 +2119,31 @@ async function ensureTabs(sheetId) {
           values: [["Month", "Bariatric", "EGD", "Back", "General Surgery", "Tummy Tuck", "Total"]],
         },
         {
-          // One first-of-month row per month that actually has a case,
-          // newest formulas spill down automatically as rows are added.
+          // One first-of-month row per month that actually has a
+          // Primary/Co-Surgeon case, newest formulas spill down
+          // automatically as rows are added.
           range: `'${TAB_TALLY}'!A2`,
-          values: [[`=SORT(UNIQUE(FILTER(EOMONTH(${allDateRange},-1)+1,${allDateRange}<>"")))`]],
+          values: [[`=SORT(UNIQUE(FILTER(EOMONTH(${tallyDateRange},-1)+1,${tallyDateRange}<>"")))`]],
         },
         {
           range: `'${TAB_TALLY}'!B2`,
-          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$O$2:$O$5000,"Bariatric")))`]],
+          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_PRIMARY}'!$A$2:$A$5000,">="&A2:A,'${TAB_PRIMARY}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_PRIMARY}'!$O$2:$O$5000,"Bariatric")))`]],
         },
         {
           range: `'${TAB_TALLY}'!C2`,
-          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$O$2:$O$5000,"EGD")))`]],
+          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_PRIMARY}'!$A$2:$A$5000,">="&A2:A,'${TAB_PRIMARY}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_PRIMARY}'!$O$2:$O$5000,"EGD")))`]],
         },
         {
           range: `'${TAB_TALLY}'!D2`,
-          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$O$2:$O$5000,"Back")))`]],
+          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_PRIMARY}'!$A$2:$A$5000,">="&A2:A,'${TAB_PRIMARY}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_PRIMARY}'!$O$2:$O$5000,"Back")))`]],
         },
         {
           range: `'${TAB_TALLY}'!E2`,
-          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$O$2:$O$5000,"General Surgery")))`]],
+          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_PRIMARY}'!$A$2:$A$5000,">="&A2:A,'${TAB_PRIMARY}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_PRIMARY}'!$O$2:$O$5000,"General Surgery")))`]],
         },
         {
           range: `'${TAB_TALLY}'!F2`,
-          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_ALL}'!$A$2:$A$5000,">="&A2:A,'${TAB_ALL}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_ALL}'!$O$2:$O$5000,"Tummy Tuck")))`]],
+          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_PRIMARY}'!$A$2:$A$5000,">="&A2:A,'${TAB_PRIMARY}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_PRIMARY}'!$O$2:$O$5000,"Tummy Tuck")))`]],
         },
         { range: `'${TAB_TALLY}'!G2`, values: [[`=ARRAYFORMULA(IF(A2:A="","",B2:B+C2:C+D2:D+E2:E+F2:F))`]] },
       ],
@@ -1958,9 +2168,14 @@ function rowFromUpdatedRange(range) {
 }
 
 async function syncCaseToDrive(c) {
-  if (!state._driveToken) {
+  // Tries a silent reauth first (see ensureFreshToken) so a case synced
+  // shortly after the token expired still goes straight through instead
+  // of landing in the queue and waiting on a manual reconnect.
+  const ready = await ensureFreshToken();
+  if (!ready) {
     if (!SYNC_QUEUE.includes(c.id)) SYNC_QUEUE.push(c.id);
     await setMeta("syncQueue", SYNC_QUEUE);
+    render(); // surface the reconnect banner right away, not just on next nav
     return;
   }
   try {
@@ -2013,7 +2228,8 @@ async function syncCaseToDrive(c) {
 }
 
 async function flushSyncQueue() {
-  if (!SYNC_QUEUE.length || !state._driveToken) return;
+  if (!SYNC_QUEUE.length) return;
+  if (!(await ensureFreshToken())) return;
   const queue = [...SYNC_QUEUE];
   SYNC_QUEUE = [];
   for (const id of queue) {
@@ -2034,11 +2250,34 @@ async function boot() {
   await loadCodes();
   state._clientId = (await getMeta("googleClientId", DEFAULT_GOOGLE_CLIENT_ID)) || DEFAULT_GOOGLE_CLIENT_ID;
   SYNC_QUEUE = (await getMeta("syncQueue", [])) || [];
+  await restoreDriveToken(); // reuse a still-valid token instead of forcing reconnect on every launch
   render();
-  initGoogleAuth();
 
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("sw.js").catch((err) => console.error("SW registration failed", err));
+  }
+
+  if (state._clientId) {
+    // Google's GSI script loads async over the network and usually
+    // isn't ready this early — wait for it before touching tokenClient,
+    // otherwise this whole attempt just silently no-ops (see
+    // waitForGoogleIdentity) and it's back to needing a manual tap for
+    // no real reason.
+    if (await waitForGoogleIdentity()) {
+      initGoogleAuth();
+      // If the restored token was missing/expired, try a silent (no-UI)
+      // reauth — on a device that's stayed signed into Google this
+      // often succeeds with no tap at all. flushSyncQueue() covers the
+      // case where a valid token was already restored; if the silent
+      // attempt fails too, the reconnect banner (see render()) is the
+      // fallback.
+      if (state._driveToken) {
+        flushSyncQueue();
+      } else {
+        const ok = await ensureFreshToken();
+        if (ok) render();
+      }
+    }
   }
 }
 

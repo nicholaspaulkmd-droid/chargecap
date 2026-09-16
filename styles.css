@@ -202,6 +202,19 @@ textarea { resize: vertical; }
 .empty-hint { color: var(--muted); font-size: 13px; margin: 4px 0; }
 .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
 
+.sync-banner {
+  position: sticky;
+  top: var(--safe-top);
+  z-index: 40;
+  background: var(--yellow);
+  color: #4a3c00;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: center;
+  padding: 10px 16px;
+  cursor: pointer;
+}
+
 .primary-btn {
   background: var(--brand);
   color: #fff;
