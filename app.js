@@ -49,10 +49,20 @@ const SHEET_HEADER = [
 // the first list it matches (e.g. a bariatric case that also includes
 // an on-table EGD still counts as bariatric). Everything else falls
 // through to General Surgery. Edit these lists if the code sets change.
-const BARIATRIC_CPT = new Set(["43633", "43860", "43644", "43659", "43775", "43845", "43774"]);
+// 43846/43843 (open bypass/sleeve) and 43848 (revision VBG) added 2026-09-23 —
+// they were on the billing sheet but missing here, so they fell to General Surgery.
+const BARIATRIC_CPT = new Set(["43633", "43860", "43644", "43846", "43659", "43775", "43843", "43845", "43774", "43848"]);
 const EGD_CPT = new Set(["43266", "43235", "43239", "43245", "43247", "43233"]);
 const BACK_CPT = new Set(["22558", "22585"]);
 const TUMMY_TUCK_CPT = new Set(["15830", "15847"]);
+// Consult / E&M codes (added 2026-09-23). A case whose CPT codes are ALL
+// from this list means the patient was seen but not operated on — it's
+// categorized "Non-Op Consult" and kept out of every surgical category
+// (and out of the tally's Total). If any procedure code is also on the
+// case, the consult code is ignored and the procedure decides the
+// category as usual.
+const CONSULT_CPT = new Set(["99221", "99222", "99223", "99232", "99238", "99252", "99253", "99254", "99255"]);
+const NON_OP_CATEGORY = "Non-Op Consult";
 
 function caseCategory(c) {
   // Normalize with .trim() — CPT entries transcribed from the source
@@ -61,6 +71,7 @@ function caseCategory(c) {
   // error, which is exactly the kind of miscategorization this
   // function exists to avoid.
   const codes = (c.cptCodes || []).map((x) => (x.code || "").trim());
+  if (codes.length && codes.every((code) => CONSULT_CPT.has(code))) return NON_OP_CATEGORY;
   if (codes.some((code) => BARIATRIC_CPT.has(code))) return "Bariatric";
   if (codes.some((code) => EGD_CPT.has(code))) return "EGD";
   if (codes.some((code) => BACK_CPT.has(code))) return "Back";
@@ -128,9 +139,42 @@ let SYNC_QUEUE = [];
 let CPT_LIB = [];
 let ICD10_LIB = [];
 
+// Codes that were in the ORIGINAL built-in favorites (data.js before
+// FAVORITES_VERSION 2). Used once, when upgrading a phone's saved library
+// to a new FAVORITES_VERSION: any saved entry whose code is NOT in this
+// list (or is category "Custom") was added by the user in the app, so it's
+// kept; everything else is replaced by the new data.js lists.
+const LEGACY_SEED_CODES = {
+  cpt: new Set(["15271", "15734", "34266", "36556", "38100", "38120", "43235", "43239", "43245", "43247", "43280", "43281", "43282", "43324", "43360", "43631 + 43659 + 44202", "43633", "43644", "43653", "43659", "43770", "43771", "43772", "43773", "43774", "43775", "43830", "43832", "43840", "43843", "43845", "43846", "43848", "43860", "44005", "44050", "44120", "44121", "44130", "44140", "44143", "44145", "44160", "44180", "44186", "44202", "44203", "44205", "44602", "44950", "44960", "44970", "47001", "47100", "47562", "47563", "47564", "47600", "47605", "47610", "49020", "49320", "49321", "49322", "49326", "49505", "49507", "49520", "49550", "49560", "49565", "49568", "49570", "49585", "49587", "49650", "49651", "49652", "49653", "49654", "49655", "49656", "49657", "58805", "60210", "60240", "60500", "64488", "99221", "99222", "99223", "99232", "99238", "99252", "99253", "99254", "99255"]),
+  icd10: new Set(["D17", "D51.0", "D73.89", "E11.9", "E43", "E66.01", "E66.3", "E66.9", "E78.0", "F32.9", "G47.30", "I10", "I25.10", "I25.9", "I26.09", "I50.20", "I51.9", "I82.4", "I87.2", "J44.9", "J45.909", "K21.0", "K21.9", "K27.3", "K27.7", "K27.9", "K28", "K28.0", "K28.1", "K28.3", "K28.4", "K29.00", "K31.1", "K35.2", "K35.3", "K35.80", "K40.20", "K40.30", "K40.90", "K40.91", "K41.9", "K42.0", "K42.9", "K43.0", "K43.2", "K43.9", "K44.9", "K45.8", "K46.9", "K52.9", "K56.1", "K56.5", "K58.0", "K58.9", "K59.0", "K63.2", "K65.1", "K66.0", "K66.1", "K76.0", "K80.00", "K80.18", "K80.66", "K80.80", "K81.0", "K81.1", "K81.2", "K81.9", "K82.4", "K82.8", "K85.10", "K91.89", "L72.3", "L98.9", "M15.0", "M25.50", "M54.5", "N83.20", "R06.00", "R06.83", "R10.0", "R11.0", "R11.10", "R11.2", "R13.10", "R19.7", "S36.00XA", "Z30.2"]),
+};
+
+function mergeFavorites(type, saved, favorites) {
+  const legacy = LEGACY_SEED_CODES[type];
+  const fresh = favorites.map((c) => ({ ...c, id: uuid() }));
+  const have = new Set(fresh.map((c) => `${c.code}|${c.category}`));
+  const freshCodes = new Set(fresh.map((c) => c.code));
+  const userAdded = (saved || []).filter((c) => {
+    const code = (c.code || "").trim();
+    const isUserAdded = c.category === "Custom" || !legacy.has(code);
+    return isUserAdded && !freshCodes.has(code) && !have.has(`${code}|${c.category}`);
+  });
+  return [...userAdded, ...fresh];
+}
+
 async function loadCodes() {
   let cpt = await idbKeyval.get("cpt", codesStore);
   let icd10 = await idbKeyval.get("icd10", codesStore);
+  const favVersion = await getMeta("favoritesVersion", 1);
+  if (typeof FAVORITES_VERSION !== "undefined" && favVersion < FAVORITES_VERSION) {
+    // Built-in favorites changed (e.g. billing sheet updated) — refresh the
+    // saved copy, keeping user-added codes. Brand-new installs just seed.
+    cpt = cpt ? mergeFavorites("cpt", cpt, CPT_FAVORITES) : null;
+    icd10 = icd10 ? mergeFavorites("icd10", icd10, ICD10_FAVORITES) : null;
+    if (cpt) await idbKeyval.set("cpt", cpt, codesStore);
+    if (icd10) await idbKeyval.set("icd10", icd10, codesStore);
+    await setMeta("favoritesVersion", FAVORITES_VERSION);
+  }
   if (!cpt) {
     cpt = CPT_FAVORITES.map((c) => ({ ...c, id: uuid() }));
     await idbKeyval.set("cpt", cpt, codesStore);
@@ -252,10 +296,14 @@ const state = {
   casesSearch: "",
   codePicker: null, // { type: 'cpt'|'icd10', category, search }
   cropSource: null, // { file, url, naturalWidth, naturalHeight } — set while the crop-before-scan screen is open
-  liveScanOpen: false, // true while the live auto-capture camera screen is open (see "Live auto-capture scan" below)
+  liveScanOpen: false, // true while the live camera screen is open (see "Live camera scan" below)
   editingCaseId: null,
   ocrBusy: false,
   showRawOcr: false,
+  // Last facility picked on the Capture screen (persisted in IndexedDB
+  // meta "lastFacility") — every new case defaults to it, since a whole
+  // operating day is usually at one location.
+  lastFacility: null,
   library: { type: "cpt", category: "All", search: "", editingId: null, adding: false, formCode: "", formDesc: "", formCategory: "" },
 };
 
@@ -266,7 +314,7 @@ function newDraft() {
     mrn: "",
     dob: "",
     dos: todayISO(),
-    facility: FACILITIES[0],
+    facility: state.lastFacility && FACILITIES.includes(state.lastFacility) ? state.lastFacility : FACILITIES[0],
     role: "primary",
     modifier: "",
     cptCodes: [],
@@ -298,13 +346,58 @@ async function runOcr(file) {
   render();
   try {
     const worker = await getOcrWorker();
-    const { data } = await worker.recognize(file);
+    const { data } = await worker.recognize(await prepareForOcr(file));
     const parsed = parseOcrText(data.text, data.words || []);
     parsed.rawText = data.text;
     return parsed;
   } finally {
     state.ocrBusy = false;
     render();
+  }
+}
+
+// Photos of an EHR screen are usually light text on a dark background
+// (e.g. white-on-blue patient banner). Tesseract reads dark-on-light
+// more reliably, so if the image is mostly dark, convert it to an
+// inverted grayscale copy first. Stickers (dark text on a white label)
+// are left untouched. Any failure just falls back to the original image.
+const DARK_IMAGE_MEAN_MAX = 100; // 0-255 average brightness below which we invert
+async function prepareForOcr(fileOrBlob) {
+  try {
+    if (typeof createImageBitmap !== "function") return fileOrBlob;
+    const bmp = await createImageBitmap(fileOrBlob);
+    const probe = document.createElement("canvas");
+    probe.width = 64;
+    probe.height = 32;
+    const pctx = probe.getContext("2d", { willReadFrequently: true });
+    pctx.drawImage(bmp, 0, 0, 64, 32);
+    const px = pctx.getImageData(0, 0, 64, 32).data;
+    let sum = 0;
+    for (let i = 0; i < px.length; i += 4) sum += px[i] * 0.299 + px[i + 1] * 0.587 + px[i + 2] * 0.114;
+    const mean = sum / (px.length / 4);
+    if (mean >= DARK_IMAGE_MEAN_MAX) {
+      if (bmp.close) bmp.close();
+      return fileOrBlob;
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = bmp.width;
+    canvas.height = bmp.height;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    ctx.drawImage(bmp, 0, 0);
+    if (bmp.close) bmp.close();
+    // Pixel loop rather than ctx.filter — canvas filters aren't supported
+    // on older iOS Safari and would silently do nothing there.
+    const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const d = img.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const v = 255 - ((d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114) | 0);
+      d[i] = d[i + 1] = d[i + 2] = v;
+    }
+    ctx.putImageData(img, 0, 0);
+    return canvas;
+  } catch (err) {
+    console.error("OCR preprocessing skipped", err);
+    return fileOrBlob;
   }
 }
 
@@ -501,41 +594,28 @@ function confirmCrop(rect, img, stage) {
 }
 
 // ---------------------------------------------------------------------
-// Live auto-capture scan
+// Live camera scan
 // ---------------------------------------------------------------------
 //
-// "Scan patient sticker" opens an in-page live camera preview instead of
-// handing off to the phone's own camera app, so the app can watch the
-// feed and snap the photo itself once a sticker looks steadily in view.
-// IMPORTANT CONSTRAINT: a web page has no access to the phone camera's
-// real autofocus signal — capture="environment" file inputs (used
-// elsewhere as the fallback) hand back a finished photo with no camera
-// state at all, and even a live getUserMedia stream doesn't expose
-// "focus locked." So "auto-capture on focus" here is approximated with
-// a cheap on-device heuristic: sample the region inside the on-screen
-// guide box a few times a second, and once it reads as both sharp
-// (in-focus-looking, via a simple gradient/edge-energy measure) and
-// steady (not moving, via frame-to-frame pixel difference) for about
-// a second, treat that as "good enough" and capture. The auto-crop is
-// simply "whatever the guide box was framing" — since the user is
-// looking at a live preview and can visually fit the sticker into that
-// box before it fires, this is far more reliable than trying to detect
-// the sticker's actual edges after the fact (which would need real
-// computer-vision segmentation this app doesn't have).
+// "Scan patient sticker" opens an in-page live camera preview with a
+// pre-framed guide box. The user fits the sticker in the box and taps
+// "Capture"; the photo is cropped to exactly what the box was framing
+// and handed to OCR — no separate crop step needed.
+//
+// v1.11: the old automatic capture (a sharpness/steadiness heuristic
+// that snapped the photo on its own) was removed at the user's request
+// after real-world use — it wasn't reliable. Capture is now manual only;
+// the guide box / auto-crop-to-box behavior is unchanged.
 //
 // `liveScan` is deliberately kept OUTSIDE `state`/render() while a scan
-// is running — same reasoning as the crop-drag rectangle above: nothing
-// should call render() while the camera is live, since a full
-// innerHTML rebuild would tear down the <video> element and orphan the
-// MediaStream. render() is only called to open the modal (before the
-// camera is requested), and to close it (after the stream is stopped).
+// is running: nothing should call render() while the camera is live,
+// since a full innerHTML rebuild would tear down the <video> element and
+// orphan the MediaStream. render() is only called to open the modal
+// (before the camera is requested), and to close it.
 const liveScan = {
   started: false, // guards against requesting the camera twice for one modal session
   stream: null,
-  timer: null,
-  prevFrame: null, // Uint8ClampedArray — previous downsized grayscale sample, for the stability check
-  steadyFrames: 0,
-  capturing: false, // true once a capture has fired, to ignore further loop ticks while it wraps up
+  capturing: false, // true once Capture was tapped, to ignore double-taps while it wraps up
 };
 
 // iOS doesn't persist the camera-access grant for a home-screen web app
@@ -575,13 +655,6 @@ document.addEventListener("visibilitychange", () => {
     releaseCamera();
   }
 });
-
-const SCAN_SAMPLE_W = 64; // downsized sample size used for the sharpness/stability check — kept
-const SCAN_SAMPLE_H = 32; // tiny on purpose so this can run several times a second on-device
-const SCAN_SHARPNESS_MIN = 12; // min avg pixel-to-pixel gradient to count as "in focus"-looking
-const SCAN_STABILITY_MAX = 6; // max avg frame-to-frame pixel delta to count as "steady"
-const SCAN_STEADY_TICKS_NEEDED = 6; // consecutive good checks before auto-capture fires
-const SCAN_CHECK_INTERVAL_MS = 120; // ~6 checks needed * 120ms ≈ 0.7s of steady+sharp before capture
 
 // Maps an on-screen element's rect (the guide box) to pixel coordinates
 // in the VIDEO's native resolution, accounting for `object-fit: cover`
@@ -646,7 +719,7 @@ async function openLiveScan() {
     }
     video.srcObject = liveScan.stream;
     await video.play().catch(() => {});
-    startAutoCaptureLoop(video);
+    showScanReady();
     return;
   }
 
@@ -673,7 +746,7 @@ async function openLiveScan() {
     liveScan.stream = stream;
     video.srcObject = stream;
     await video.play().catch(() => {});
-    startAutoCaptureLoop(video);
+    showScanReady();
   } catch (err) {
     console.error("getUserMedia failed", err);
     fallbackToFilePicker("Live camera unavailable — using your camera app instead");
@@ -688,76 +761,11 @@ function fallbackToFilePicker(message) {
   if (camInput) camInput.click();
 }
 
-function startAutoCaptureLoop(video) {
-  const guideEl = document.getElementById("scanGuide");
-  if (!guideEl) return;
-  const sampleCanvas = document.createElement("canvas");
-  sampleCanvas.width = SCAN_SAMPLE_W;
-  sampleCanvas.height = SCAN_SAMPLE_H;
-  const ctx = sampleCanvas.getContext("2d", { willReadFrequently: true });
-
-  liveScan.prevFrame = null;
-  liveScan.steadyFrames = 0;
+// Camera is live — prompt the user to frame the sticker and tap Capture.
+function showScanReady() {
   liveScan.capturing = false;
-
-  liveScan.timer = setInterval(() => {
-    if (liveScan.capturing || !video.videoWidth) return;
-
-    const { sx, sy, sw, sh } = guideRectToVideoPixels(video, guideEl);
-    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, SCAN_SAMPLE_W, SCAN_SAMPLE_H);
-    const { data } = ctx.getImageData(0, 0, SCAN_SAMPLE_W, SCAN_SAMPLE_H);
-
-    const gray = new Uint8ClampedArray(SCAN_SAMPLE_W * SCAN_SAMPLE_H);
-    for (let i = 0, p = 0; i < data.length; i += 4, p++) {
-      gray[p] = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114) | 0;
-    }
-
-    // Sharpness proxy: average horizontal pixel-to-pixel gradient. A
-    // blurry/out-of-focus sample has soft transitions everywhere; crisp
-    // text (like a sticker's printed name/MRN) has sharp ones.
-    let gradientSum = 0, gradientCount = 0;
-    for (let y = 0; y < SCAN_SAMPLE_H; y++) {
-      for (let x = 1; x < SCAN_SAMPLE_W; x++) {
-        gradientSum += Math.abs(gray[y * SCAN_SAMPLE_W + x] - gray[y * SCAN_SAMPLE_W + x - 1]);
-        gradientCount++;
-      }
-    }
-    const sharpness = gradientCount ? gradientSum / gradientCount : 0;
-
-    // Stability: average per-pixel change vs. the previous sample —
-    // low means the phone (and the sticker) held still.
-    let stability = Infinity;
-    if (liveScan.prevFrame) {
-      let diffSum = 0;
-      for (let i = 0; i < gray.length; i++) diffSum += Math.abs(gray[i] - liveScan.prevFrame[i]);
-      stability = diffSum / gray.length;
-    }
-    liveScan.prevFrame = gray;
-
-    const good = sharpness >= SCAN_SHARPNESS_MIN && stability <= SCAN_STABILITY_MAX;
-    liveScan.steadyFrames = good ? liveScan.steadyFrames + 1 : 0;
-    updateScanStatus(liveScan.steadyFrames, good);
-
-    if (liveScan.steadyFrames >= SCAN_STEADY_TICKS_NEEDED) {
-      captureLiveFrame(video, guideEl);
-    }
-  }, SCAN_CHECK_INTERVAL_MS);
-}
-
-function updateScanStatus(steadyFrames, good) {
   const statusEl = document.getElementById("scanStatus");
-  const guideEl = document.getElementById("scanGuide");
-  if (!statusEl || !guideEl) return;
-  if (steadyFrames >= SCAN_STEADY_TICKS_NEEDED) {
-    statusEl.textContent = "Got it — capturing…";
-    guideEl.classList.add("locked");
-  } else if (good) {
-    statusEl.textContent = "Hold still…";
-    guideEl.classList.add("locked");
-  } else {
-    statusEl.textContent = "Fit the sticker in the box";
-    guideEl.classList.remove("locked");
-  }
+  if (statusEl) statusEl.textContent = "Fit the sticker in the box, then tap Capture";
 }
 
 // Crops the guide box's region out of the live video at full camera
@@ -766,7 +774,6 @@ function updateScanStatus(steadyFrames, good) {
 function captureLiveFrame(video, guideEl) {
   if (liveScan.capturing) return;
   liveScan.capturing = true;
-  if (liveScan.timer) clearInterval(liveScan.timer);
   const statusEl = document.getElementById("scanStatus");
   if (statusEl) statusEl.textContent = "Captured!";
 
@@ -784,18 +791,14 @@ function captureLiveFrame(video, guideEl) {
   }, "image/jpeg", 0.92);
 }
 
-// Stops the analysis loop and closes the modal. Every path that can end
-// a live-scan session (Cancel, "use camera app instead", a capture
-// firing, or getUserMedia failing) goes through this. It does NOT stop
+// Closes the live-scan modal. Every path that can end a live-scan
+// session (Cancel, "use camera app instead", a capture, or
+// getUserMedia failing) goes through this. It does NOT stop
 // the camera stream itself by default — the stream is left warm for
 // CAMERA_IDLE_RELEASE_MS so the next scan can reuse it without a new
 // permission prompt (see openLiveScan()); pass {immediate: true} (used
 // when the app is backgrounded) to release it right away instead.
 function closeLiveScan({ immediate = false } = {}) {
-  if (liveScan.timer) clearInterval(liveScan.timer);
-  liveScan.timer = null;
-  liveScan.prevFrame = null;
-  liveScan.steadyFrames = 0;
   liveScan.capturing = false;
   liveScan.started = false;
   state.liveScanOpen = false;
@@ -825,6 +828,11 @@ const NAME_DISQUALIFY_CONTEXT = /\b(ATTENDING|ADMITTING|REFERRING|ORDERING|SURGE
 // Some stickers print the attending physician as "LAST, MD, FIRST, M"
 // (e.g. "PAULK, MD, NICHOLAS, J") — a credential sitting where a first
 // name would in a plain "Last, First" match. Reject those.
+// Words that show up as short Title-Case lines on EHR screen banners but
+// are never a patient's name — keeps the "First M. Last" screen fallback
+// in parseOcrText() from grabbing them.
+const SCREEN_NON_NAME_WORDS = /\b(Male|Female|Bed|Room|Unit|Floor|Code|Status|Full|Allergies|Isolation|Precautions|Admitted|Admission|Location|Inpatient|Outpatient|Observation|Emergency|Surgery|Pre|Post|Op|Medical|Center|Hospital|Health|Clinic|Intermountain|Chart|Summary|Orders|Results|Notes|Review)\b/;
+
 const CREDENTIAL_WORD = /^(MD|DO|PA|PA-C|NP|DPM|RN|CRNA|PHD)$/i;
 
 // A date on a sticker that is NOT the birthdate — most commonly the
@@ -872,7 +880,7 @@ function parseOcrText(text, words) {
   //    admission/DOS/discharge, etc.) rather than just grabbing
   //    whichever date happens to appear first (often an encounter date
   //    up top).
-  const AGE_MARKER_RE = /\b\d{1,2}\s*(?:yrs?\.?|y\.?o\.?|years?\s*old|years?)\b/i;
+  const AGE_MARKER_RE = /\b\d{1,3}\s*(?:yrs?\.?|y\.?[o0]\.?|years?\s*old|years?)(?=\W|$)/i;
   const DATE_RE = /\b(\d{1,2}[\/\-]\d{1,2}[\/\-](?:19|20)\d{2})\b/;
 
   let dobRaw = null;
@@ -986,6 +994,26 @@ function parseOcrText(text, words) {
         !/\d/.test(l)
     );
     if (capsLine) nameGuess = capsLine;
+  }
+  if (!nameGuess) {
+    // EHR screen banner style (added 2026-09-23): the name sits alone on
+    // its own line in normal "First M. Last" capitalization with no label
+    // and no comma, e.g. "Lesley M. Webster" above a "Female, 77 y.o.,
+    // 7/23/1949" line. Take the first such line and flip it to the
+    // "Last, First M." format the rest of the app uses.
+    const titleLine = lines.find(
+      (l) =>
+        /^[A-Z][a-z'\-]+(?:\s+(?:[A-Z]\.?|[A-Z][A-Za-z'\-]*[a-z][A-Za-z'\-]*)){1,3}$/.test(l) &&
+        l.length <= 35 &&
+        !NAME_EXCLUDE_WORDS.test(l) &&
+        !NAME_DISQUALIFY_CONTEXT.test(l) &&
+        !SCREEN_NON_NAME_WORDS.test(l)
+    );
+    if (titleLine) {
+      const parts = titleLine.split(/\s+/);
+      const last = parts[parts.length - 1];
+      nameGuess = `${last}, ${parts.slice(0, -1).join(" ")}`;
+    }
   }
   if (nameGuess) {
     result.patientName = nameGuess.replace(/\s{2,}/g, " ").trim();
@@ -1209,7 +1237,7 @@ function renderSettings() {
     <div class="content">
       <section class="card">
         <h2>Google Drive sync</h2>
-        <p class="muted">Every saved case backs up automatically to a spreadsheet called <strong>${SHEET_NAME}</strong> in your Google Drive — primary/co-surgeon cases on one tab, assistant cases on another, plus a Monthly Tally tab that auto-counts Bariatric/EGD/Back/General Surgery/Tummy Tuck cases per month. Data goes only to your own Google account — no other server is involved.</p>
+        <p class="muted">Every saved case backs up automatically to a spreadsheet called <strong>${SHEET_NAME}</strong> in your Google Drive — primary/co-surgeon cases on one tab, assistant cases on another, plus a Monthly Tally tab that auto-counts Bariatric/EGD/Back/General Surgery/Tummy Tuck cases per month, with Non-Op Consults (consult codes only, no procedure) counted separately. Data goes only to your own Google account — no other server is involved.</p>
         <div class="field">
           <label>Google OAuth Client ID</label>
           <input id="f_clientId" type="text" value="${escapeHtml(state._clientId || "")}" placeholder="xxxx.apps.googleusercontent.com" />
@@ -1387,12 +1415,10 @@ function renderCropModal() {
     </div>`;
 }
 
-// Live in-page camera preview with the auto-capture guide box — see the
-// "Live auto-capture scan" section above for how the capture and crop
-// actually happen. "Use camera app instead" is always offered alongside
-// the automatic fallback so there's a reliable manual escape hatch if
-// the live preview or auto-capture heuristic misbehaves on a given
-// phone/lighting.
+// Live in-page camera preview with the pre-framed guide box — see the
+// "Live camera scan" section above. "Use camera app instead" is always
+// offered as a manual escape hatch if the live preview misbehaves on a
+// given phone.
 function renderLiveScanModal() {
   return `
     <div class="modal-backdrop scan-backdrop">
@@ -1403,7 +1429,7 @@ function renderLiveScanModal() {
           <p id="scanStatus" class="scan-status">Starting camera…</p>
         </div>
         <div class="scan-actions">
-          <button type="button" id="scanCaptureBtn" class="primary-btn">📷 Capture now</button>
+          <button type="button" id="scanCaptureBtn" class="primary-btn">📷 Capture</button>
           <div class="scan-actions-row">
             <button type="button" id="scanUseFilePickerBtn" class="secondary-btn">Use camera app instead</button>
             <button type="button" id="scanCancelBtn" class="secondary-btn">Cancel</button>
@@ -1476,7 +1502,10 @@ function bindCaptureEvents() {
     if (el) el.addEventListener("input", () => { d[f] = el.value; syncSaveButton(); });
   });
   const facilityEl = document.getElementById("f_facility");
-  if (facilityEl) facilityEl.addEventListener("change", () => (d.facility = facilityEl.value));
+  if (facilityEl) facilityEl.addEventListener("change", () => {
+    d.facility = facilityEl.value;
+    rememberFacility(d.facility);
+  });
 
   app.querySelectorAll("[data-role]").forEach((el) =>
     el.addEventListener("click", () => {
@@ -1505,6 +1534,7 @@ function bindCaptureEvents() {
   const saveBtn = document.getElementById("saveCaseBtn");
   if (saveBtn) saveBtn.addEventListener("click", async () => {
     await saveCase(d);
+    rememberFacility(d.facility);
     toast("Case saved");
     state.draft = null;
     state.view = "cases";
@@ -1519,7 +1549,7 @@ function bindCaptureEvents() {
 // Wires the live-scan modal's buttons and kicks off the actual camera
 // request — but only the first time this modal is bound. bindEvents()
 // re-runs after every render(), but nothing calls render() while a scan
-// is in progress (see the "Live auto-capture scan" section above), so
+// is in progress (see the "Live camera scan" section above), so
 // in practice this only ever fires once per modal session; the
 // `liveScan.started` guard just makes that explicit instead of relying
 // on it.
@@ -1553,6 +1583,12 @@ function bindLiveScanEvents() {
     liveScan.started = true;
     openLiveScan();
   }
+}
+
+function rememberFacility(f) {
+  if (!f) return;
+  state.lastFacility = f;
+  setMeta("lastFacility", f).catch((err) => console.error("lastFacility save failed", err));
 }
 
 function syncSaveButton() {
@@ -2039,7 +2075,13 @@ async function findOrCreateSheet() {
 // the corrected formulas on next sync instead of keeping the old ones
 // (the live spreadsheet was also hand-fixed directly on 2026-09-16 —
 // this bump just makes sure a fresh ensureTabs() run agrees with it).
-const TABS_SCHEMA_VERSION = 5;
+// v6 (2026-09-23): added the "Non-Op Consults" tally column (H) — cases
+// whose only CPT codes are consult/E&M codes (see CONSULT_CPT). Placed
+// AFTER Total on purpose: Total (G) stays the operative-case count and
+// does NOT include consults. Also re-tags any already-synced consult-only
+// rows' Category cell (column O) from "General Surgery" to
+// "Non-Op Consult" — see retagNonOpRows().
+const TABS_SCHEMA_VERSION = 6;
 
 // Makes sure the four tabs (Primary & Co-Surgeon, Assistant, All Cases,
 // Monthly Tally) exist with headers + formulas in place, and that the
@@ -2115,8 +2157,8 @@ async function ensureTabs(sheetId) {
           values: [[`=SORT({'${TAB_PRIMARY}'!A2:O5000;'${TAB_ASSISTANT}'!A2:O5000},1,TRUE)`]],
         },
         {
-          range: `'${TAB_TALLY}'!A1:G1`,
-          values: [["Month", "Bariatric", "EGD", "Back", "General Surgery", "Tummy Tuck", "Total"]],
+          range: `'${TAB_TALLY}'!A1:H1`,
+          values: [["Month", "Bariatric", "EGD", "Back", "General Surgery", "Tummy Tuck", "Total", "Non-Op Consults"]],
         },
         {
           // One first-of-month row per month that actually has a
@@ -2146,11 +2188,48 @@ async function ensureTabs(sheetId) {
           values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_PRIMARY}'!$A$2:$A$5000,">="&A2:A,'${TAB_PRIMARY}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_PRIMARY}'!$O$2:$O$5000,"Tummy Tuck")))`]],
         },
         { range: `'${TAB_TALLY}'!G2`, values: [[`=ARRAYFORMULA(IF(A2:A="","",B2:B+C2:C+D2:D+E2:E+F2:F))`]] },
+        {
+          range: `'${TAB_TALLY}'!H2`,
+          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_PRIMARY}'!$A$2:$A$5000,">="&A2:A,'${TAB_PRIMARY}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_PRIMARY}'!$O$2:$O$5000,"${NON_OP_CATEGORY}")))`]],
+        },
       ],
     }),
   });
 
+  await retagNonOpRows(sheetId);
   await setMeta("tabsReady", TABS_SCHEMA_VERSION);
+}
+
+// One-time fix-up for the v6 "Non-Op Consult" category: cases already
+// synced before v6 had their Category cell (column O) written as
+// "General Surgery". For each such case we know the row of (via
+// _sheetSync), re-read that row first and only rewrite column O if the
+// row's MRN + patient name still match the case — so a row that's been
+// moved/sorted by hand is left alone rather than overwritten blindly.
+async function retagNonOpRows(sheetId) {
+  const targets = CASES.filter(
+    (c) => c._sheetSync && c._sheetSync.tab && c._sheetSync.row && caseCategory(c) === NON_OP_CATEGORY
+  );
+  if (!targets.length) return;
+  const ranges = targets.map((c) => `'${c._sheetSync.tab}'!A${c._sheetSync.row}:O${c._sheetSync.row}`);
+  const qs = ranges.map((r) => "ranges=" + encodeURIComponent(r)).join("&");
+  const res = await driveFetchOk(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values:batchGet?${qs}`);
+  const json = await res.json();
+  const data = [];
+  (json.valueRanges || []).forEach((vr, i) => {
+    const c = targets[i];
+    const row = (vr.values && vr.values[0]) || [];
+    if (String(row[1] || "") !== String(c.patientName || "")) return;
+    if (String(row[2] || "") !== String(c.mrn || "")) return;
+    if (row[14] === NON_OP_CATEGORY) return;
+    data.push({ range: `'${c._sheetSync.tab}'!O${c._sheetSync.row}`, values: [[NON_OP_CATEGORY]] });
+  });
+  if (!data.length) return;
+  await driveFetchOk(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values:batchUpdate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ valueInputOption: "USER_ENTERED", data }),
+  });
 }
 
 async function ensureSpreadsheet() {
@@ -2248,6 +2327,7 @@ window.addEventListener("online", flushSyncQueue);
 async function boot() {
   await loadCases();
   await loadCodes();
+  state.lastFacility = await getMeta("lastFacility", null);
   state._clientId = (await getMeta("googleClientId", DEFAULT_GOOGLE_CLIENT_ID)) || DEFAULT_GOOGLE_CLIENT_ID;
   SYNC_QUEUE = (await getMeta("syncQueue", [])) || [];
   await restoreDriveToken(); // reuse a still-valid token instead of forcing reconnect on every launch

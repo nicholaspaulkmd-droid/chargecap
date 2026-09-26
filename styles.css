@@ -449,7 +449,7 @@ textarea { resize: vertical; }
   border: 0;
 }
 
-/* Live auto-capture scan modal — full-screen camera preview, not the
+/* Live camera scan modal — full-screen camera preview, not the
    bottom-sheet style the other modals use. */
 .scan-backdrop {
   align-items: stretch;
@@ -486,9 +486,7 @@ textarea { resize: vertical; }
   border: 3px solid rgba(255, 255, 255, 0.85);
   border-radius: 12px;
   box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.55);
-  transition: border-color 0.15s ease;
 }
-.scan-guide.locked { border-color: var(--green); }
 .scan-status {
   position: absolute;
   left: 0;

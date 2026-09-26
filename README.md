@@ -11,10 +11,15 @@ Claude.ai chat prototype with a real, installable app.
   filters and search, settings panel.
 - "Scan patient sticker" opens a live in-page camera preview (not the
   phone's own camera app) with an on-screen guide box — align the
-  sticker in the box and it auto-captures once the feed looks sharp and
-  steady for about a second, then crops to exactly that box before
-  handing off to OCR. A "Capture now" button skips the wait, and "Use
-  camera app instead" falls back to the old tap-and-shoot flow (which
+  sticker in the box and tap "Capture" — the photo is cropped to exactly
+  that box before handing off to OCR. (Auto-capture was removed in
+  v1.11.) Photos of an EHR screen banner (light text on dark, name as
+  "First M. Last") are also read; the Facility field defaults to the last
+  one you used.
+- Code favorites (`data.js`) were rebuilt on 2026-09-23 from the updated
+  "Billing Sheet - OR.xlsx". When `FAVORITES_VERSION` in `data.js` is
+  bumped, the app refreshes the phone's saved code library on next launch,
+  keeping any codes you added yourself in the app. "Use camera app instead" falls back to the old tap-and-shoot flow (which
   also kicks in automatically if the browser can't do live camera
   access, or camera permission is denied).
 - On-device OCR via Tesseract.js — no server involved, extracts patient
@@ -106,7 +111,12 @@ automatically in your Drive, with four tabs:
 - **Assistant** — one row per case where your role is Assistant.
 - **All Cases** — a hidden helper tab that just unions the two above;
   no need to look at it directly.
-- **Monthly Tally** — auto-counts, per month, how many Bariatric / EGD /
+- **Monthly Tally** — (v1.11) counts Primary & Co-Surgeon cases only, and
+  has a separate **Non-Op Consults** column after Total: a case whose CPT
+  codes are ALL consult codes (`CONSULT_CPT`: 99221, 99222, 99223, 99232,
+  99238, 99252, 99253, 99254, 99255) is tagged "Non-Op Consult" and is not counted in
+  any surgical category or in Total. Older notes below:
+  auto-counts, per month, how many Bariatric / EGD /
   Back / General Surgery cases you logged (across both role tabs
   combined). Each is determined by CPT code (see `BARIATRIC_CPT` /
   `EGD_CPT` / `BACK_CPT` near the top of `app.js` if those code lists
