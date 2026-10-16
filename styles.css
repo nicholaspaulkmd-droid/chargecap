@@ -637,3 +637,8 @@ textarea { resize: vertical; }
 }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 .toast.error { background: var(--red); }
+
+/* v1.12 — "Missing from the sheet" review list */
+.missing-list { margin: 10px 0; display: flex; flex-direction: column; gap: 6px; }
+.missing-row { display: flex; gap: 10px; align-items: flex-start; font-size: 14px; line-height: 1.35; padding: 8px; border-radius: 8px; background: rgba(0,0,0,0.04); }
+.missing-row input { margin-top: 3px; width: 18px; height: 18px; flex: none; }

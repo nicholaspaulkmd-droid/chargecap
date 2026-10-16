@@ -28,8 +28,13 @@ const TAB_PRIMARY = "Primary & Co-Surgeon";
 const TAB_ASSISTANT = "Assistant";
 const TAB_ALL = "All Cases";
 const TAB_TALLY = "Monthly Tally";
-const DATA_TABS = [TAB_PRIMARY, TAB_ASSISTANT];
-const ALL_TABS = [TAB_PRIMARY, TAB_ASSISTANT, TAB_ALL, TAB_TALLY];
+// v1.13: consult-only cases (see caseCategory) are STORED on their own
+// tab — they no longer appear on Primary/Assistant at all. All Cases and
+// the Monthly Tally read from it. (v1.12 had briefly made this a FILTER
+// view of the role tabs; that was never deployed.)
+const TAB_CONSULTS = "Non-Op Consults";
+const DATA_TABS = [TAB_PRIMARY, TAB_ASSISTANT, TAB_CONSULTS];
+const ALL_TABS = [TAB_PRIMARY, TAB_ASSISTANT, TAB_ALL, TAB_TALLY, TAB_CONSULTS];
 
 // "Surgeon" removed 2026-09-11 — redundant with Role (Primary/Co-surgeon/
 // Assistant already identifies who's who). Every column from Role onward
@@ -81,6 +86,12 @@ function caseCategory(c) {
 
 function tabForRole(role) {
   return role === "assistant" ? TAB_ASSISTANT : TAB_PRIMARY;
+}
+
+// The tab a case's row belongs on: consult-only cases go to the
+// Non-Op Consults tab regardless of role; everything else by role.
+function tabForCase(c) {
+  return caseCategory(c) === NON_OP_CATEGORY ? TAB_CONSULTS : tabForRole(c.role);
 }
 
 // ---------------------------------------------------------------------
@@ -304,6 +315,11 @@ const state = {
   // meta "lastFacility") — every new case defaults to it, since a whole
   // operating day is usually at one location.
   lastFacility: null,
+  // v1.12 sheet reconciliation (see reconcileWithSheet)
+  missingIds: [],
+  missingSelected: new Set(),
+  reconcileBusy: false,
+  reconcileCheckedAt: null,
   library: { type: "cpt", category: "All", search: "", editingId: null, adding: false, formCode: "", formDesc: "", formCategory: "" },
 };
 
@@ -345,11 +361,7 @@ async function runOcr(file) {
   state.ocrBusy = true;
   render();
   try {
-    const worker = await getOcrWorker();
-    const { data } = await worker.recognize(await prepareForOcr(file));
-    const parsed = parseOcrText(data.text, data.words || []);
-    parsed.rawText = data.text;
-    return parsed;
+    return await ocrExtract(file);
   } finally {
     state.ocrBusy = false;
     render();
@@ -399,6 +411,83 @@ async function prepareForOcr(fileOrBlob) {
     console.error("OCR preprocessing skipped", err);
     return fileOrBlob;
   }
+}
+
+// v1.12: OCR + parse, with a second pass when the first one misses
+// any field. Pass 2 uses prepareAdaptive() — every region is normalized
+// to dark-text-on-light on its own, which helps a phone photo of a
+// monitor where a light-on-dark banner sits inside a mostly-white
+// screen (too bright overall for prepareForOcr to invert), or where
+// glare washes out part of it. Pass 2 only fills fields pass 1 left
+// blank; it never overrides a pass-1 read.
+async function ocrExtract(fileOrBlob) {
+  const worker = await getOcrWorker();
+  const { data } = await worker.recognize(await prepareForOcr(fileOrBlob));
+  const parsed = parseOcrText(data.text, data.words || []);
+  parsed.rawText = data.text;
+  if (parsed.patientName && parsed.mrn && parsed.dob) return parsed;
+  try {
+    const alt = await prepareAdaptive(fileOrBlob);
+    if (!alt) return parsed;
+    const { data: d2 } = await worker.recognize(alt);
+    const p2 = parseOcrText(d2.text, d2.words || []);
+    for (const f of ["patientName", "mrn", "dob"]) {
+      if (!parsed[f] && p2[f]) {
+        parsed[f] = p2[f];
+        if (p2.lowConfidenceFields.includes(f) && !parsed.lowConfidenceFields.includes(f)) parsed.lowConfidenceFields.push(f);
+      }
+    }
+    parsed.rawText = `${data.text}\n--- second pass ---\n${d2.text}`;
+  } catch (err) {
+    console.error("Second OCR pass skipped", err);
+  }
+  return parsed;
+}
+
+// Grayscale + local inversion: each pixel is compared with the average
+// brightness of its neighborhood (box ~1/25 of the image width, via an
+// integral image), and pixels in dark neighborhoods are inverted — so
+// light-on-dark banners and dark-on-light text both end up dark-on-
+// light. Large photos are scaled to <= 2000px wide first for speed.
+async function prepareAdaptive(fileOrBlob) {
+  if (typeof createImageBitmap !== "function") return null;
+  const bmp = await createImageBitmap(fileOrBlob);
+  const scale = Math.min(1, 2000 / bmp.width);
+  const w = Math.max(1, Math.round(bmp.width * scale));
+  const h = Math.max(1, Math.round(bmp.height * scale));
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(bmp, 0, 0, w, h);
+  if (bmp.close) bmp.close();
+  const img = ctx.getImageData(0, 0, w, h);
+  const d = img.data;
+  const gray = new Uint8ClampedArray(w * h);
+  for (let i = 0, j = 0; j < gray.length; i += 4, j++) gray[j] = (d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114) | 0;
+  const integ = new Float64Array((w + 1) * (h + 1));
+  for (let y = 1; y <= h; y++) {
+    let rowSum = 0;
+    for (let x = 1; x <= w; x++) {
+      rowSum += gray[(y - 1) * w + (x - 1)];
+      integ[y * (w + 1) + x] = integ[(y - 1) * (w + 1) + x] + rowSum;
+    }
+  }
+  const r = Math.max(8, Math.round(w / 50));
+  for (let y = 0; y < h; y++) {
+    const y0 = Math.max(0, y - r), y1 = Math.min(h, y + r + 1);
+    for (let x = 0; x < w; x++) {
+      const x0 = Math.max(0, x - r), x1 = Math.min(w, x + r + 1);
+      const sum = integ[y1 * (w + 1) + x1] - integ[y0 * (w + 1) + x1] - integ[y1 * (w + 1) + x0] + integ[y0 * (w + 1) + x0];
+      const mean = sum / ((x1 - x0) * (y1 - y0));
+      const g = gray[y * w + x];
+      const v = mean < 128 ? 255 - g : g;
+      const k = (y * w + x) * 4;
+      d[k] = d[k + 1] = d[k + 2] = v;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  return canvas;
 }
 
 // Runs OCR on whatever image (original photo or a cropped Blob from
@@ -831,7 +920,13 @@ const NAME_DISQUALIFY_CONTEXT = /\b(ATTENDING|ADMITTING|REFERRING|ORDERING|SURGE
 // Words that show up as short Title-Case lines on EHR screen banners but
 // are never a patient's name — keeps the "First M. Last" screen fallback
 // in parseOcrText() from grabbing them.
-const SCREEN_NON_NAME_WORDS = /\b(Male|Female|Bed|Room|Unit|Floor|Code|Status|Full|Allergies|Isolation|Precautions|Admitted|Admission|Location|Inpatient|Outpatient|Observation|Emergency|Surgery|Pre|Post|Op|Medical|Center|Hospital|Health|Clinic|Intermountain|Chart|Summary|Orders|Results|Notes|Review)\b/;
+const SCREEN_NON_NAME_WORDS = /\b(Male|Female|Bed|Room|Unit|Floor|Code|Status|Full|Allergies|Allergy|Isolation|Precautions|Admitted|Admission|Admit|Discharge|Location|Inpatient|Outpatient|Observation|Emergency|Surgery|Pre|Post|Op|Medical|Center|Hospital|Health|Clinic|Intermountain|Chart|Summary|Orders|Order|Results|Notes|Review|Medications?|Administration|Record|Problem|List|Vitals|Encounters?|Plan|History|Flowsheets?|Labs?|Imaging|Patient|Provider|Care|Team|Nursing|Documentation|Overview|Visit|Today|Schedule|Weight|Height|Attending|Primary|Insurance|Penicillin|Sulfa|None|Known|NKDA)\b/i;
+
+// v1.12: text that, when it sits just before a "Word, Word" pair on the
+// same line, means the pair is a list (allergies, diagnoses…) rather
+// than "Last, First" — e.g. "Allergies: Penicillin, Sulfa".
+const NAME_LIST_CONTEXT = /\b(ALLERG\w*|DX|DIAG\w*|PROBLEM\w*|HISTORY|HX|MEDS?|MEDICATIONS?|PROCEDURES?|ISOLATION|PRECAUTIONS?|CODE\s*STATUS)\b/i;
+const NAME_PARTICLES = new Set(["de", "del", "della", "la", "las", "los", "van", "von", "der", "den", "da", "di", "du", "le", "st", "st.", "bin", "al", "y"]);
 
 const CREDENTIAL_WORD = /^(MD|DO|PA|PA-C|NP|DPM|RN|CRNA|PHD)$/i;
 
@@ -852,6 +947,57 @@ const DOB_DISQUALIFY_CONTEXT = /\b(PRINTED|CREATED)\b/i;
 // wrong or incomplete can be inspected on-device via the "View scanned
 // text" toggle in the Capture tab, without needing to share real
 // patient data anywhere to debug it.
+// v1.12 — see the screen-banner step in parseOcrText().
+function nameSegment(line) {
+  let seg = line.replace(/^[^A-Za-z]+/, ""); // leading icon/OCR junk ("★", "+", "%")
+  const cut = seg.search(/\s{2,}|[|•·~©®]|\s[-–—]\s|\b(?:Male|Female|Sex|Age|DOB|D\.O\.B|MRN|Born|BD|Bed|Room)\b|\d/);
+  if (cut >= 0) seg = seg.slice(0, cut);
+  return seg.replace(/[^A-Za-z.]+$/, "").trim();
+}
+
+function looksLikeName(seg) {
+  if (!seg || seg.length > 40) return false;
+  if (NAME_EXCLUDE_WORDS.test(seg) || NAME_DISQUALIFY_CONTEXT.test(seg) || SCREEN_NON_NAME_WORDS.test(seg)) return false;
+  const toks = seg.split(/\s+/);
+  if (toks.length < 2 || toks.length > 5) return false;
+  const WORD = /^(?:[A-Z][a-z]+|[A-Z][a-z]*['’][A-Z][a-z]+|Mc[A-Z][a-z]+|Mac[A-Z][a-z]+|[A-Z]{2,})(?:-(?:[A-Z][a-z]+|[A-Z][a-z]*['’][A-Z][a-z]+|[A-Z]{2,}))?$/;
+  const INITIAL = /^[A-Z]\.?$/;
+  let words = 0;
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    const inner = i > 0 && i < toks.length - 1;
+    if (WORD.test(t)) { words++; continue; }
+    if (INITIAL.test(t) && inner) continue;
+    if (NAME_PARTICLES.has(t.toLowerCase()) && inner) continue;
+    return false;
+  }
+  return words >= 2 && WORD.test(toks[0]) && WORD.test(toks[toks.length - 1]);
+}
+
+// "First M. de la Last" -> "de la Last, First M." (the app's format).
+function flipToLastFirst(seg) {
+  const toks = seg.split(/\s+/);
+  let i = toks.length - 1;
+  while (i - 1 > 0 && NAME_PARTICLES.has(toks[i - 1].toLowerCase())) i--;
+  return `${toks.slice(i).join(" ")}, ${toks.slice(0, i).join(" ")}`;
+}
+
+function findScreenName(lines) {
+  const DEMO_RE = /\b\d{1,3}\s*(?:yrs?\.?|y\.?[o0]\.?|years?)(?=\W|$)|\b(?:Male|Female|DOB|D\.O\.B|MRN)\b|\b\d{1,2}[\/\-]\d{1,2}[\/\-](?:19|20)\d{2}\b/i;
+  const order = [];
+  const demoIdx = lines.findIndex((l) => DEMO_RE.test(l));
+  if (demoIdx >= 0) {
+    order.push(demoIdx);
+    if (demoIdx > 0) order.push(demoIdx - 1);
+  }
+  lines.forEach((_, i) => { if (!order.includes(i)) order.push(i); });
+  for (const i of order) {
+    const seg = nameSegment(lines[i]);
+    if (looksLikeName(seg)) return flipToLastFirst(seg);
+  }
+  return null;
+}
+
 function parseOcrText(text, words) {
   const result = { patientName: "", mrn: "", dob: "", lowConfidenceFields: [] };
   const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
@@ -978,9 +1124,12 @@ function parseOcrText(text, words) {
       const prevEndsWithLabel = labelTailRe.test(prevLine);
       const context = prevEndsWithLabel ? `${prevLine} ${line}` : line;
       if (NAME_DISQUALIFY_CONTEXT.test(context)) continue;
-      for (const lf of line.matchAll(/([A-Z][A-Za-z'\-]+),\s*([A-Z][A-Za-z'\-]+)/g)) {
+      for (const lf of line.matchAll(/([A-Z][A-Za-z'\-]+),\s*([A-Z][A-Za-z'\-]+)(?:\s+([A-Z])\b\.?)?/g)) {
         if (CREDENTIAL_WORD.test(lf[2])) continue;
-        nameGuess = lf[0];
+        // v1.12: "Allergies: Penicillin, Sulfa" is a list, not a name.
+        if (NAME_LIST_CONTEXT.test(line.slice(0, lf.index))) continue;
+        if (SCREEN_NON_NAME_WORDS.test(lf[1]) || SCREEN_NON_NAME_WORDS.test(lf[2])) continue;
+        nameGuess = lf[3] ? `${lf[1]}, ${lf[2]} ${lf[3]}` : `${lf[1]}, ${lf[2]}`;
         break outer;
       }
     }
@@ -996,24 +1145,18 @@ function parseOcrText(text, words) {
     if (capsLine) nameGuess = capsLine;
   }
   if (!nameGuess) {
-    // EHR screen banner style (added 2026-09-23): the name sits alone on
-    // its own line in normal "First M. Last" capitalization with no label
-    // and no comma, e.g. "Lesley M. Webster" above a "Female, 77 y.o.,
-    // 7/23/1949" line. Take the first such line and flip it to the
-    // "Last, First M." format the rest of the app uses.
-    const titleLine = lines.find(
-      (l) =>
-        /^[A-Z][a-z'\-]+(?:\s+(?:[A-Z]\.?|[A-Z][A-Za-z'\-]*[a-z][A-Za-z'\-]*)){1,3}$/.test(l) &&
-        l.length <= 35 &&
-        !NAME_EXCLUDE_WORDS.test(l) &&
-        !NAME_DISQUALIFY_CONTEXT.test(l) &&
-        !SCREEN_NON_NAME_WORDS.test(l)
-    );
-    if (titleLine) {
-      const parts = titleLine.split(/\s+/);
-      const last = parts[parts.length - 1];
-      nameGuess = `${last}, ${parts.slice(0, -1).join(" ")}`;
-    }
+    // EHR screen banner style (v1.11, reworked v1.12). The name has no
+    // label and no comma, in normal "First M. Last" capitalization. v1.11
+    // only accepted a line that was EXACTLY a name, which fails on the
+    // very common one-row banner where OCR returns the whole row as one
+    // line ("Lesley M. Webster Female 77 y.o. DOB: 7/23/1949 MRN: …"),
+    // and on hyphenated / multi-part names ("Mary-Jo O'Neil-Garcia",
+    // "Ana Lucia de la Cruz"). Now: take the text at the START of a line
+    // up to the first sex/age/DOB/MRN token, digit or column gap, and
+    // test that for a name shape. Lines are tried in order of how likely
+    // they are to hold the name: the line with the DOB/age on it first,
+    // then the line just above it, then everything else.
+    nameGuess = findScreenName(lines);
   }
   if (nameGuess) {
     result.patientName = nameGuess.replace(/\s{2,}/g, " ").trim();
@@ -1080,8 +1223,11 @@ function render() {
   // fallback instead of having to notice sync stopped and go find
   // Settings → Connect on your own.
   const needsReconnect = !state._driveToken && state._clientId && SYNC_QUEUE.length && state.view !== "settings";
+  const missingCount = (state.missingIds || []).length;
   const syncBanner = needsReconnect
     ? `<div class="sync-banner" id="syncBanner">⚠️ ${SYNC_QUEUE.length} case(s) waiting to sync — tap to reconnect Google Drive</div>`
+    : missingCount && state.view !== "settings"
+    ? `<div class="sync-banner" id="missingBanner">⚠️ ${missingCount} case(s) on this phone aren't on the sheet — tap to review</div>`
     : "";
 
   app.innerHTML = `<div class="screen">${syncBanner}${body}</div>${tab}${state.codePicker ? renderCodePicker() : ""}${state.cropSource ? renderCropModal() : ""}${state.liveScanOpen ? renderLiveScanModal() : ""}`;
@@ -1237,7 +1383,7 @@ function renderSettings() {
     <div class="content">
       <section class="card">
         <h2>Google Drive sync</h2>
-        <p class="muted">Every saved case backs up automatically to a spreadsheet called <strong>${SHEET_NAME}</strong> in your Google Drive — primary/co-surgeon cases on one tab, assistant cases on another, plus a Monthly Tally tab that auto-counts Bariatric/EGD/Back/General Surgery/Tummy Tuck cases per month, with Non-Op Consults (consult codes only, no procedure) counted separately. Data goes only to your own Google account — no other server is involved.</p>
+        <p class="muted">Every saved case backs up automatically to a spreadsheet called <strong>${SHEET_NAME}</strong> in your Google Drive — primary/co-surgeon cases on one tab, assistant cases on another, plus a Monthly Tally tab that auto-counts Bariatric/EGD/Back/General Surgery/Tummy Tuck cases per month, with Non-Op Consults (consult codes only, no procedure) counted separately and listed on their own Non-Op Consults tab. Data goes only to your own Google account — no other server is involved.</p>
         <div class="field">
           <label>Google OAuth Client ID</label>
           <input id="f_clientId" type="text" value="${escapeHtml(state._clientId || "")}" placeholder="xxxx.apps.googleusercontent.com" />
@@ -1250,6 +1396,28 @@ function renderSettings() {
         ${SYNC_QUEUE.length ? `<p class="hint">${SYNC_QUEUE.length} case(s) queued to sync once connected/online.</p>` : ""}
       </section>
 
+      <section class="card" id="missingCard">
+        <h2>Missing from the sheet</h2>
+        <p class="muted">Compares every case saved on this phone with the ${SHEET_NAME} spreadsheet and lists any that never made it there.</p>
+        <button id="reconcileBtn" class="secondary-btn" ${state.reconcileBusy || !state._clientId ? "disabled" : ""}>
+          ${state.reconcileBusy ? "Checking…" : "Check for missing cases"}
+        </button>
+        ${(state.missingIds || []).length ? `
+          <div class="missing-list">
+            ${state.missingIds.map((id) => {
+              const c = CASES.find((x) => x.id === id);
+              if (!c) return "";
+              return `<label class="missing-row">
+                <input type="checkbox" data-missing-toggle="${c.id}" ${state.missingSelected.has(c.id) ? "checked" : ""} />
+                <span><strong>${fmtDate(c.dos)}</strong> · ${escapeHtml(c.patientName) || "(no name)"} · ${escapeHtml(c.facility)} · ${escapeHtml(caseCategory(c))}${c.role === "assistant" ? " · Assist" : ""}</span>
+              </label>`;
+            }).join("")}
+          </div>
+          <button id="addMissingBtn" class="primary-btn" ${state.reconcileBusy || !state.missingSelected.size ? "disabled" : ""}>Add ${state.missingSelected.size} to sheet</button>
+          <p class="hint">Uncheck anything you don't want on the sheet (e.g. old test cases).</p>
+        ` : state.reconcileCheckedAt ? `<p class="hint">✓ Last check: everything on this phone is on the sheet.</p>` : ""}
+      </section>
+
       <section class="card">
         <h2>Code library</h2>
         <p class="muted">${CPT_LIB.length} CPT · ${ICD10_LIB.length} ICD-10 codes. Add, edit, or remove codes any time — changes are saved on this device immediately, no redeploy needed.</p>
@@ -1258,7 +1426,7 @@ function renderSettings() {
 
       <section class="card">
         <h2>About</h2>
-        <p class="muted">ChargeCap v1.0 · ${CASES.length} case(s) stored locally on this device (IndexedDB).</p>
+        <p class="muted">ChargeCap v1.13 · ${CASES.length} case(s) stored locally on this device (IndexedDB).</p>
         <p class="muted small">CPT/ICD-10 favorites were imported from your OR billing sheets — double-check codes against current documentation before relying on them for claims.</p>
       </section>
     </div>`;
@@ -1458,6 +1626,13 @@ function bindEvents() {
 
   const syncBannerEl = document.getElementById("syncBanner");
   if (syncBannerEl) syncBannerEl.addEventListener("click", connectGoogleDrive);
+  const missingBannerEl = document.getElementById("missingBanner");
+  if (missingBannerEl) missingBannerEl.addEventListener("click", () => {
+    state.view = "settings";
+    render();
+    const card = document.getElementById("missingCard");
+    if (card) card.scrollIntoView({ block: "start" });
+  });
 
   if (state.view === "capture") bindCaptureEvents();
   if (state.view === "cases") bindCasesEvents();
@@ -1645,6 +1820,17 @@ function bindSettingsEvents() {
   });
   const connectBtn = document.getElementById("driveConnectBtn");
   if (connectBtn) connectBtn.addEventListener("click", connectGoogleDrive);
+  const reconcileBtn = document.getElementById("reconcileBtn");
+  if (reconcileBtn) reconcileBtn.addEventListener("click", () => reconcileWithSheet({ manual: true }));
+  const addMissingBtn = document.getElementById("addMissingBtn");
+  if (addMissingBtn) addMissingBtn.addEventListener("click", addMissingToSheet);
+  app.querySelectorAll("[data-missing-toggle]").forEach((el) =>
+    el.addEventListener("change", () => {
+      const id = el.dataset.missingToggle;
+      if (el.checked) state.missingSelected.add(id); else state.missingSelected.delete(id);
+      render();
+    })
+  );
 }
 
 function bindLibraryEvents() {
@@ -1849,7 +2035,9 @@ function exportCsv(list, filename) {
 function caseToRow(c) {
   return [
     fmtDate(c.dos), c.patientName, c.mrn, fmtDate(c.dob), c.role, c.modifier, c.facility,
-    c.status, c.billedAt ? new Date(c.billedAt).toLocaleString() : "",
+    // The sheet's own word for billed is "done" (also what the weekly
+    // biller-email script writes), so write that rather than "billed".
+    c.status === "billed" ? "done" : c.status, c.billedAt ? new Date(c.billedAt).toLocaleString() : "",
     c.cptCodes.map((x) => x.code).join("; "),
     c.cptCodes.map((x) => x.label || x.desc).join("; "),
     c.icd10Codes.map((x) => x.code).join("; "),
@@ -1906,6 +2094,18 @@ function initGoogleAuth() {
       resolvers.forEach((r) => r(true));
       flushSyncQueue();
     },
+    // v1.12: GIS reports popup failures (blocked / closed / failed to
+    // open — common for a silent attempt inside an iOS home-screen app)
+    // ONLY through error_callback, never through callback above. Without
+    // this, the pending promise in requestToken() never settled and any
+    // sync waiting on it hung forever — the case was never queued, no
+    // banner, no toast. That is how cases from 10/3–10/15 silently
+    // never reached the sheet.
+    error_callback: () => {
+      const resolvers = pendingTokenResolvers.splice(0);
+      silentAttemptInFlight = false;
+      resolvers.forEach((r) => r(false));
+    },
   });
 }
 
@@ -1923,10 +2123,25 @@ async function restoreDriveToken() {
 // Wraps tokenClient.requestAccessToken() in a Promise. silent:true uses
 // prompt:"" (no popup/consent UI — succeeds only if Google can reissue a
 // token without asking the user anything; fails quietly otherwise).
+const TOKEN_REQUEST_TIMEOUT_MS = 20000;
 function requestToken({ silent = false } = {}) {
   return new Promise((resolve) => {
     if (!tokenClient) { resolve(false); return; }
-    pendingTokenResolvers.push(resolve);
+    // Belt and braces with error_callback above: if Google never answers
+    // at all, give up after TOKEN_REQUEST_TIMEOUT_MS (silent attempts
+    // only — a manual sign-in can legitimately take longer) so the
+    // caller falls through to queue + reconnect banner instead of hanging.
+    let settled = false;
+    const done = (ok) => { if (!settled) { settled = true; resolve(ok); } };
+    pendingTokenResolvers.push(done);
+    if (silent) {
+      setTimeout(() => {
+        const i = pendingTokenResolvers.indexOf(done);
+        if (i >= 0) pendingTokenResolvers.splice(i, 1);
+        if (!settled) silentAttemptInFlight = false;
+        done(false);
+      }, TOKEN_REQUEST_TIMEOUT_MS);
+    }
     if (silent) silentAttemptInFlight = true;
     // Silent: prompt:"" — no UI, succeeds only if Google can reissue
     // without asking anything. Manual: no override, same as before —
@@ -2081,7 +2296,10 @@ async function findOrCreateSheet() {
 // does NOT include consults. Also re-tags any already-synced consult-only
 // rows' Category cell (column O) from "General Surgery" to
 // "Non-Op Consult" — see retagNonOpRows().
-const TABS_SCHEMA_VERSION = 6;
+// v7 (2026-10-16): added the "Non-Op Consults" tab (TAB_CONSULTS).
+// v8 (2026-10-16): Non-Op Consults becomes a real data tab (no formula);
+// All Cases stacks all three data tabs; Tally months + column H read it.
+const TABS_SCHEMA_VERSION = 8;
 
 // Makes sure the four tabs (Primary & Co-Surgeon, Assistant, All Cases,
 // Monthly Tally) exist with headers + formulas in place, and that the
@@ -2116,11 +2334,12 @@ async function ensureTabs(sheetId) {
       requests.push({ addSheet: { properties: { title: TAB_PRIMARY } } });
     }
   }
-  [TAB_ASSISTANT, TAB_ALL, TAB_TALLY].forEach((title) => {
+  [TAB_ASSISTANT, TAB_ALL, TAB_TALLY, TAB_CONSULTS].forEach((title) => {
     if (!existingTitles.includes(title)) requests.push({ addSheet: { properties: { title } } });
   });
 
   if (requests.length) {
+    sheetMetaCache = null;
     await driveFetchOk(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -2149,12 +2368,13 @@ async function ensureTabs(sheetId) {
         { range: `'${TAB_PRIMARY}'!A1:O1`, values: [SHEET_HEADER] },
         { range: `'${TAB_ASSISTANT}'!A1:O1`, values: [SHEET_HEADER] },
         { range: `'${TAB_ALL}'!A1:O1`, values: [SHEET_HEADER] },
+        { range: `'${TAB_CONSULTS}'!A1:O1`, values: [SHEET_HEADER] },
         {
-          // Stacks both role tabs into one sorted-by-date table so
-          // there's a single combined log to look at — this tab is NOT
-          // what the tally counts from (see tallyDateRange above).
+          // Stacks all three data tabs into one sorted-by-date log (blank
+          // rows filtered out) — this tab is NOT what the tally counts
+          // from (see tallyDateRange above).
           range: `'${TAB_ALL}'!A2`,
-          values: [[`=SORT({'${TAB_PRIMARY}'!A2:O5000;'${TAB_ASSISTANT}'!A2:O5000},1,TRUE)`]],
+          values: [[`=SORT(FILTER({'${TAB_PRIMARY}'!A2:O5000;'${TAB_ASSISTANT}'!A2:O5000;'${TAB_CONSULTS}'!A2:O5000},{'${TAB_PRIMARY}'!A2:A5000;'${TAB_ASSISTANT}'!A2:A5000;'${TAB_CONSULTS}'!A2:A5000}<>""),1,TRUE)`]],
         },
         {
           range: `'${TAB_TALLY}'!A1:H1`,
@@ -2164,8 +2384,10 @@ async function ensureTabs(sheetId) {
           // One first-of-month row per month that actually has a
           // Primary/Co-Surgeon case, newest formulas spill down
           // automatically as rows are added.
+          // v8: months come from Primary AND Non-Op Consults, so a month
+          // with only consults still gets a row.
           range: `'${TAB_TALLY}'!A2`,
-          values: [[`=SORT(UNIQUE(FILTER(EOMONTH(${tallyDateRange},-1)+1,${tallyDateRange}<>"")))`]],
+          values: [[`=SORT(UNIQUE(FILTER(EOMONTH({${tallyDateRange};'${TAB_CONSULTS}'!A2:A5000},-1)+1,{${tallyDateRange};'${TAB_CONSULTS}'!A2:A5000}<>"")))`]],
         },
         {
           range: `'${TAB_TALLY}'!B2`,
@@ -2190,14 +2412,24 @@ async function ensureTabs(sheetId) {
         { range: `'${TAB_TALLY}'!G2`, values: [[`=ARRAYFORMULA(IF(A2:A="","",B2:B+C2:C+D2:D+E2:E+F2:F))`]] },
         {
           range: `'${TAB_TALLY}'!H2`,
-          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_PRIMARY}'!$A$2:$A$5000,">="&A2:A,'${TAB_PRIMARY}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_PRIMARY}'!$O$2:$O$5000,"${NON_OP_CATEGORY}")))`]],
+          // v8: counts every row on the Non-Op Consults tab for the month.
+          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_CONSULTS}'!$A$2:$A$5000,">="&A2:A,'${TAB_CONSULTS}'!$A$2:$A$5000,"<"&EDATE(A2:A,1))))`]],
         },
       ],
     }),
   });
 
-  await retagNonOpRows(sheetId);
+  // v8: consult cases already synced to a role tab get moved to the
+  // Non-Op Consults tab on their next sync (syncCaseToDriveInner sees the
+  // tab differs, deletes the old row and appends to the new tab) — queue
+  // them now so that happens right away. (retagNonOpRows is no longer
+  // needed: consult rows don't live on the role tabs any more.)
   await setMeta("tabsReady", TABS_SCHEMA_VERSION);
+  for (const c of CASES) {
+    if (caseCategory(c) === NON_OP_CATEGORY && c._sheetSync && c._sheetSync.tab !== TAB_CONSULTS) {
+      await enqueueSync(c.id);
+    }
+  }
 }
 
 // One-time fix-up for the v6 "Non-Op Consult" category: cases already
@@ -2246,21 +2478,57 @@ function rowFromUpdatedRange(range) {
   return m ? Number(m[1]) : null;
 }
 
-async function syncCaseToDrive(c) {
+// v1.12: a case is put in the persisted queue BEFORE any network work
+// and only taken out once the sheet write succeeds. Previously it was
+// queued only after a failure was detected — so if the sync hung (see
+// error_callback in initGoogleAuth) or iOS suspended the app mid-sync
+// right after Save, the case was never queued and never retried.
+const syncInFlight = new Set();
+async function enqueueSync(id) {
+  if (!SYNC_QUEUE.includes(id)) SYNC_QUEUE.push(id);
+  await setMeta("syncQueue", SYNC_QUEUE);
+}
+async function dequeueSync(id) {
+  SYNC_QUEUE = SYNC_QUEUE.filter((x) => x !== id);
+  await setMeta("syncQueue", SYNC_QUEUE);
+}
+
+async function syncCaseToDrive(c, { quiet = false } = {}) {
+  await enqueueSync(c.id);
+  if (syncInFlight.has(c.id)) return; // already being written; it stays queued either way
+  syncInFlight.add(c.id);
+  try {
+    await syncCaseToDriveInner(c, { quiet });
+  } finally {
+    syncInFlight.delete(c.id);
+  }
+}
+
+async function syncCaseToDriveInner(c, { quiet }) {
   // Tries a silent reauth first (see ensureFreshToken) so a case synced
   // shortly after the token expired still goes straight through instead
-  // of landing in the queue and waiting on a manual reconnect.
+  // of waiting on a manual reconnect.
   const ready = await ensureFreshToken();
   if (!ready) {
-    if (!SYNC_QUEUE.includes(c.id)) SYNC_QUEUE.push(c.id);
-    await setMeta("syncQueue", SYNC_QUEUE);
     render(); // surface the reconnect banner right away, not just on next nav
     return;
   }
   try {
     const sheetId = await ensureSpreadsheet();
-    const tab = tabForRole(c.role);
-    const row = caseToRow(c);
+    const tab = tabForCase(c);
+    let row = caseToRow(c);
+
+    // v1.12: before overwriting a row in place, make sure it is still
+    // THIS case (rows can shift if the sheet is sorted or a row deleted
+    // by hand). If it isn't, look the case up; if it can't be found,
+    // fall through and append it fresh rather than clobbering someone
+    // else's row.
+    if (c._sheetSync && c._sheetSync.tab && c._sheetSync.row) {
+      const verified = await verifyOrLocateRow(sheetId, c);
+      c._sheetSync = verified;
+      if (!verified) await saveCase(c);
+      row = caseToRow(c); // status may have been adopted from the sheet
+    }
 
     if (c._sheetSync && c._sheetSync.tab === tab && c._sheetSync.row) {
       // Already has a row on the right tab (from an earlier save, or a
@@ -2276,49 +2544,304 @@ async function syncCaseToDrive(c) {
       );
     } else {
       if (c._sheetSync && c._sheetSync.tab && c._sheetSync.row) {
-        // Role was changed after an earlier sync (e.g. edited from
-        // "assistant" to "primary") — clear the stale row on the old
-        // tab so the same case doesn't show up twice.
-        await driveFetchOk(
-          `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/'${c._sheetSync.tab}'!A${c._sheetSync.row}:O${c._sheetSync.row}:clear`,
-          { method: "POST" }
-        );
+        // The case now belongs on a different tab (role changed, or it
+        // became / stopped being consult-only). Its old row was just
+        // verified to be this case (verifyOrLocateRow above), so delete
+        // that row outright — v1.13: deleting rather than clearing, so no
+        // empty gap is left inside a formatted table.
+        await deleteSheetRow(sheetId, c._sheetSync.tab, c._sheetSync.row);
+        c._sheetSync = null;
       }
-      const appendRes = await driveFetchOk(
-        `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/'${tab}'!A1:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ values: [row] }),
-        }
-      );
-      const appendJson = await appendRes.json();
-      const rowNum = rowFromUpdatedRange(appendJson.updates && appendJson.updates.updatedRange);
-      c._sheetSync = { tab, row: rowNum };
+      c._sheetSync = await appendCaseRow(sheetId, tab, c, row);
       await saveCase(c); // persist the row pointer so later edits update instead of re-appending
     }
-    toast("Synced to Google Sheets");
+    await dequeueSync(c.id);
+    if (!quiet) toast("Synced to Google Sheets");
+    render();
   } catch (err) {
     console.error(err);
-    if (!SYNC_QUEUE.includes(c.id)) SYNC_QUEUE.push(c.id);
-    await setMeta("syncQueue", SYNC_QUEUE);
-    toast("Sync failed — queued, will retry", true);
+    if (!quiet) toast("Sync failed — queued, will retry", true);
   }
 }
 
-async function flushSyncQueue() {
-  if (!SYNC_QUEUE.length) return;
-  if (!(await ensureFreshToken())) return;
-  const queue = [...SYNC_QUEUE];
-  SYNC_QUEUE = [];
-  for (const id of queue) {
-    const c = CASES.find((x) => x.id === id);
-    if (c) await syncCaseToDrive(c);
+// ---------------------------------------------------------------------
+// Tables-aware writes (v1.13)
+// ---------------------------------------------------------------------
+// The data tabs may be formatted as Google Sheets "Tables" (Format →
+// Convert to table). values.append (what the app used before) writes
+// BELOW a table, not into it. The Sheets API's AppendCellsRequest with a
+// tableId appends into the table body instead ("appends the values to
+// the first free row … inserts rows to the end of the table and before
+// any footer"). So: look up each tab's numeric sheetId and table (if
+// any), and append through the table when there is one; fall back to
+// values.append on a plain tab.
+let sheetMetaCache = null;
+async function getSheetMeta(sheetId, { refresh = false } = {}) {
+  if (sheetMetaCache && sheetMetaCache.id === sheetId && !refresh) return sheetMetaCache.tabs;
+  const res = await driveFetchOk(
+    `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=${encodeURIComponent("sheets(properties(sheetId,title),tables(tableId,name,range))")}`
+  );
+  const json = await res.json();
+  const tabs = {};
+  for (const s of json.sheets || []) {
+    const title = s.properties.title;
+    // The case table is the one anchored at A1 (header row 1).
+    const table = (s.tables || []).find((t) => {
+      const r = t.range || {};
+      return (r.startRowIndex || 0) === 0 && (r.startColumnIndex || 0) === 0;
+    });
+    tabs[title] = { gridId: s.properties.sheetId, tableId: table ? table.tableId : null };
   }
-  await setMeta("syncQueue", SYNC_QUEUE);
+  sheetMetaCache = { id: sheetId, tabs };
+  return tabs;
+}
+
+// Date serial for Sheets (days since 1899-12-30) from "MM/DD/YYYY".
+function sheetSerialFromMDY(str) {
+  const m = String(str || "").match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!m) return null;
+  return Date.UTC(+m[3], +m[1] - 1, +m[2]) / 86400000 + 25569;
+}
+
+// One row (caseToRow output) as AppendCellsRequest CellData, typed the
+// way USER_ENTERED would have typed it: Date (A) and DOB (D) as real
+// dates, plain whole numbers (MRN, modifier) as numbers unless they have
+// a leading zero, everything else as text.
+function rowToCellData(row) {
+  return row.map((v, i) => {
+    const str = v == null ? "" : String(v);
+    if (str === "") return {};
+    if (i === 0 || i === 3) {
+      const serial = sheetSerialFromMDY(str);
+      if (serial != null) return { userEnteredValue: { numberValue: serial } };
+    }
+    if (/^[1-9]\d{0,14}$/.test(str)) return { userEnteredValue: { numberValue: Number(str) } };
+    return { userEnteredValue: { stringValue: str } };
+  });
+}
+
+async function appendCaseRow(sheetId, tab, c, row) {
+  let meta = await getSheetMeta(sheetId);
+  if (!meta[tab]) meta = await getSheetMeta(sheetId, { refresh: true });
+  const info = meta[tab];
+  if (info && info.tableId) {
+    await driveFetchOk(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        requests: [{
+          appendCells: {
+            tableId: info.tableId,
+            rows: [{ values: rowToCellData(row) }],
+            fields: "userEnteredValue",
+          },
+        }],
+      }),
+    });
+    // appendCells doesn't report the row it wrote — look it up.
+    return findCaseInTabs(c, await readDataTabs(sheetId));
+  }
+  const appendRes = await driveFetchOk(
+    `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/'${tab}'!A1:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ values: [row] }),
+    }
+  );
+  const appendJson = await appendRes.json();
+  return { tab, row: rowFromUpdatedRange(appendJson.updates && appendJson.updates.updatedRange) };
+}
+
+async function deleteSheetRow(sheetId, tab, rowNum) {
+  let meta = await getSheetMeta(sheetId);
+  if (!meta[tab]) meta = await getSheetMeta(sheetId, { refresh: true });
+  const info = meta[tab];
+  if (!info) return;
+  await driveFetchOk(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      requests: [{
+        deleteDimension: { range: { sheetId: info.gridId, dimension: "ROWS", startIndex: rowNum - 1, endIndex: rowNum } },
+      }],
+    }),
+  });
+}
+
+// ---------------------------------------------------------------------
+// Sheet reconciliation (v1.12)
+// ---------------------------------------------------------------------
+// The phone is the source of truth: every case lives in IndexedDB
+// whether or not it reached the sheet. reconcileWithSheet() reads both
+// data tabs, matches each phone case to a row (same date of service AND
+// same MRN, or same name when MRN is blank), and lists every case that
+// has no matching row. Runs automatically on launch and from Settings →
+// "Check for missing cases"; the user reviews the list and taps "Add to
+// sheet" — nothing is appended without that tap.
+
+function sheetDateToISO(v) {
+  if (v == null) return "";
+  const str = String(v).trim();
+  let m = str.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+  m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+  if (m) {
+    const y = m[3].length === 2 ? "20" + m[3] : m[3];
+    return `${y}-${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}`;
+  }
+  return str;
+}
+const normName = (n) => String(n || "").toLowerCase().replace(/[^a-z]/g, "");
+const normMrn = (n) => String(n || "").replace(/\D/g, "").replace(/^0+/, "");
+
+function caseMatchesRow(c, row) {
+  if (!row || !row.length) return false;
+  if (sheetDateToISO(row[0]) !== c.dos) return false;
+  const cm = normMrn(c.mrn), rm = normMrn(row[2]);
+  if (cm && rm) return cm === rm;
+  const cn = normName(c.patientName), rn = normName(row[1]);
+  if (cn && rn) return cn === rn;
+  // No usable identifier on one side — fall back to the CPT list.
+  return String(row[9] || "").replace(/\s/g, "") === c.cptCodes.map((x) => x.code).join(";");
+}
+
+async function readDataTabs(sheetId) {
+  const qs = DATA_TABS.map((t) => "ranges=" + encodeURIComponent(`'${t}'!A2:O5000`)).join("&");
+  const res = await driveFetchOk(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values:batchGet?${qs}`);
+  const json = await res.json();
+  const out = {};
+  DATA_TABS.forEach((t, i) => { out[t] = ((json.valueRanges || [])[i] || {}).values || []; });
+  return out;
+}
+
+function findCaseInTabs(c, tabs) {
+  // Prefer the tab the case's role belongs on, then the other one.
+  const order = [tabForCase(c), ...DATA_TABS.filter((t) => t !== tabForCase(c))];
+  for (const t of order) {
+    const rows = tabs[t] || [];
+    for (let i = 0; i < rows.length; i++) {
+      if (caseMatchesRow(c, rows[i])) return { tab: t, row: i + 2 };
+    }
+  }
+  return null;
+}
+
+// v1.13: the weekly biller-email script (Apps Script in the sheet) marks
+// rows "done". If the sheet says done/billed and the phone still says
+// pending, the phone adopts it — so the phone's Pending list clears and
+// a later re-sync of the case can't flip the sheet back to "pending".
+async function adoptSheetStatus(c, row) {
+  if (!row || c.status !== "pending") return false;
+  if (!/^(done|billed)$/i.test(String(row[7] || "").trim())) return false;
+  c.status = "billed";
+  c.billedAt = Date.now();
+  await saveCase(c);
+  return true;
+}
+
+async function verifyOrLocateRow(sheetId, c) {
+  const { tab, row } = c._sheetSync;
+  const res = await driveFetchOk(
+    `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(`'${tab}'!A${row}:O${row}`)}`
+  );
+  const json = await res.json();
+  if (caseMatchesRow(c, (json.values || [])[0])) {
+    await adoptSheetStatus(c, (json.values || [])[0]);
+    return { tab, row };
+  }
+  const tabs = await readDataTabs(sheetId);
+  const found = findCaseInTabs(c, tabs);
+  if (found) await adoptSheetStatus(c, tabs[found.tab][found.row - 2]);
+  return found;
+}
+
+async function reconcileWithSheet({ manual = false } = {}) {
+  if (!(await ensureFreshToken())) {
+    if (manual) toast("Connect Google Drive first", true);
+    render();
+    return;
+  }
+  state.reconcileBusy = true;
+  if (manual) render();
+  try {
+    const sheetId = await ensureSpreadsheet();
+    const tabs = await readDataTabs(sheetId);
+    const missing = [];
+    for (const c of CASES) {
+      const found = findCaseInTabs(c, tabs);
+      if (found) {
+        await adoptSheetStatus(c, tabs[found.tab][found.row - 2]);
+        // Also repair a stale row pointer while we're here.
+        if (!c._sheetSync || c._sheetSync.tab !== found.tab || c._sheetSync.row !== found.row) {
+          c._sheetSync = found;
+          await saveCase(c);
+        }
+      } else if (!SYNC_QUEUE.includes(c.id)) {
+        missing.push(c.id);
+      }
+    }
+    missing.sort((a, b) => {
+      const ca = CASES.find((x) => x.id === a), cb = CASES.find((x) => x.id === b);
+      return String(ca.dos).localeCompare(String(cb.dos));
+    });
+    state.missingIds = missing;
+    state.missingSelected = new Set(missing);
+    state.reconcileCheckedAt = Date.now();
+    if (manual) toast(missing.length ? `${missing.length} case(s) on this phone are not on the sheet` : "Everything on this phone is on the sheet ✓", !!missing.length);
+  } catch (err) {
+    console.error(err);
+    if (manual) toast("Couldn't read the sheet — try again", true);
+  } finally {
+    state.reconcileBusy = false;
+    render();
+  }
+}
+
+async function addMissingToSheet() {
+  const ids = [...(state.missingSelected || [])];
+  if (!ids.length) return;
+  state.reconcileBusy = true;
+  render();
+  for (const id of ids) {
+    const c = CASES.find((x) => x.id === id);
+    if (!c) continue;
+    c._sheetSync = null; // force a fresh append
+    await saveCase(c);
+    await syncCaseToDrive(c, { quiet: true });
+  }
+  state.reconcileBusy = false;
+  await reconcileWithSheet({ manual: true });
+}
+
+let flushing = false;
+async function flushSyncQueue() {
+  if (flushing || !SYNC_QUEUE.length) return;
+  flushing = true;
+  try {
+    if (!(await ensureFreshToken())) { render(); return; }
+    const queue = [...SYNC_QUEUE];
+    let ok = 0;
+    for (const id of queue) {
+      const c = CASES.find((x) => x.id === id);
+      if (!c) { await dequeueSync(id); continue; } // case deleted on the phone
+      await syncCaseToDrive(c, { quiet: true });
+      if (!SYNC_QUEUE.includes(id)) ok++;
+    }
+    if (ok) toast(`Synced ${ok} queued case(s) to Google Sheets`);
+    if (SYNC_QUEUE.length) toast(`${SYNC_QUEUE.length} case(s) still waiting to sync`, true);
+  } finally {
+    flushing = false;
+    render();
+  }
 }
 
 window.addEventListener("online", flushSyncQueue);
+// iOS rarely fires "online" for a home-screen app; coming back to the
+// foreground is the realistic moment to retry anything still queued.
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") flushSyncQueue();
+});
 
 // ---------------------------------------------------------------------
 // Boot
@@ -2351,11 +2874,14 @@ async function boot() {
       // case where a valid token was already restored; if the silent
       // attempt fails too, the reconnect banner (see render()) is the
       // fallback.
+      if (!state._driveToken) await ensureFreshToken();
       if (state._driveToken) {
-        flushSyncQueue();
+        await flushSyncQueue();
+        // v1.12: compare what's on this phone with what's on the sheet
+        // and surface anything missing (see reconcileWithSheet).
+        reconcileWithSheet({ manual: false });
       } else {
-        const ok = await ensureFreshToken();
-        if (ok) render();
+        render();
       }
     }
   }

@@ -1,4 +1,44 @@
-# ChargeCap v1.0
+# ChargeCap v1.13
+
+## v1.13 (2026-10-16) — deploy this instead of v1.12
+- **Writes into Google Sheets Tables.** If a data tab has been converted to
+  a table (Format → Convert to table), new cases are added with the Sheets
+  API's AppendCellsRequest + tableId, so they land INSIDE the table (first
+  free row, else a new row at the end of the table). Dates go in as real
+  dates. Tabs without a table still use values.append.
+- **Non-Op Consults is a real data tab.** Consult-only cases are saved only
+  there (any role), never on Primary/Assistant. All Cases stacks all three
+  tabs (blank rows filtered out); Monthly Tally months and column H read
+  the consult tab. TABS_SCHEMA_VERSION 8. Consult cases already on a role
+  tab are moved on the next sync (old row deleted, not just cleared).
+- A case moving tabs (role edit / becomes a consult) deletes its old row
+  instead of leaving a blank one.
+- sw.js CACHE_VERSION chargecap-v24.
+
+
+## v1.12 (2026-10-16) — what changed
+- **Sync can no longer silently skip a case.** Cause of the 10/3–10/15
+  gap: when the ~1-hr Google token had expired, the app's silent re-sign-in
+  could fail without Google ever answering (iOS home-screen apps block the
+  hidden popup), and the save's sync then waited forever — the case was
+  never queued, so no banner and no retry. Now every case is queued before
+  any network work and only removed once the sheet write succeeds; silent
+  sign-in has an error handler + 20 s timeout; the queue retries whenever
+  the app comes back to the foreground.
+- **Settings → "Missing from the sheet".** Compares every case on the phone
+  with the sheet (date of service + MRN, or name if no MRN) and lists what
+  isn't there, with checkboxes and an "Add N to sheet" button. Also runs on
+  launch and shows a yellow banner if anything is missing.
+- **Row-pointer safety.** Before updating a case's row in place (e.g.
+  billed toggle), the app checks the row is still that patient; if rows
+  moved it finds the right one or appends, instead of overwriting.
+- **Screen-banner names.** Reads the name when it shares a line with
+  sex/age/DOB/MRN, hyphenated/apostrophe names, "de la"-style surnames,
+  leading icons; ignores "Allergies: X, Y"; keeps middle initials on
+  "LAST, FIRST M" stickers. A second OCR pass (local contrast
+  normalization) runs only when the first pass misses a field.
+- (Superseded in v1.13) A FILTER-view Non-Op Consults tab.
+- sw.js CACHE_VERSION chargecap-v23.
 
 Surgical charge capture PWA for Dr. Paulk. Built to spec against
 `ChargeCap_Spec_and_Build_Guide.docx`. This replaces the earlier v0.6
