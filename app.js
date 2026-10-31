@@ -1,20 +1,15 @@
-// app.js — ChargeCap v1.0
+// app.js — ChargeCap v2.1
 // Vanilla JS, no framework. Uses idb-keyval (IndexedDB) for storage,
 // Tesseract.js for on-device OCR, NLM ClinicalTables API for live ICD-10
-// search, and the Google Identity Services + Sheets API for Drive sync.
+// search, and MSAL.js + Microsoft Graph for sync to an Excel workbook in
+// the practice's Microsoft 365 OneDrive (v2.0; v1.x used Google Sheets).
 
 // ---------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------
 
-// Paste your Google OAuth 2.0 Web Client ID here after completing the
-// Google Cloud Console steps in README.md. Leave blank to run with
-// Drive sync disabled — every other feature works without it.
-// This can also be set (and is persisted) from the in-app Settings panel,
-// so you do not have to rebuild/redeploy just to add it later.
-const DEFAULT_GOOGLE_CLIENT_ID = "";
-
-const SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file";
+// Microsoft 365 app registration IDs are in the sync section near the
+// bottom of this file (M365_CLIENT_ID / M365_TENANT_ID).
 const SHEET_NAME = "ChargeCap Log";
 
 // Tab layout inside the single "ChargeCap Log" spreadsheet:
@@ -209,6 +204,7 @@ async function addCodeToLib(type, entry) {
   const clean = { id: uuid(), code: entry.code.trim(), desc: entry.desc.trim(), category: (entry.category || "Custom").trim() || "Custom" };
   lib.unshift(clean);
   await persistCodeLib(type);
+  await queueCodeOp({ op: "add", type, code: clean.code, desc: clean.desc, category: clean.category });
   return clean;
 }
 
@@ -216,15 +212,29 @@ async function updateCodeInLib(type, id, patch) {
   const lib = codeLib(type);
   const item = lib.find((c) => c.id === id);
   if (!item) return;
+  const from = { code: item.code, category: item.category, desc: item.desc };
   Object.assign(item, patch);
   await persistCodeLib(type);
+  await queueCodeOp({ op: "update", type, from, code: item.code, desc: item.desc, category: item.category });
 }
 
 async function deleteCodeFromLib(type, id) {
   const lib = codeLib(type);
   const idx = lib.findIndex((c) => c.id === id);
-  if (idx >= 0) lib.splice(idx, 1);
+  if (idx < 0) return;
+  const [gone] = lib.splice(idx, 1);
   await persistCodeLib(type);
+  await queueCodeOp({ op: "delete", type, code: gone.code, category: gone.category, desc: gone.desc });
+}
+
+// v2.1: every library change is also logged as an operation and replayed
+// onto the "Code Library" tab of the OneDrive workbook (syncCodeLibrary),
+// so the library survives app updates, reinstalls, and a new phone.
+async function queueCodeOp(op) {
+  const ops = (await getMeta("codeOps", [])) || [];
+  ops.push({ ...op, at: Date.now() });
+  await setMeta("codeOps", ops);
+  scheduleCodeLibrarySync();
 }
 
 function isCodeInLib(type, code) {
@@ -265,8 +275,10 @@ function uuid() {
 }
 
 function todayISO() {
+  // v2.0: LOCAL date. toISOString() is UTC, so after 6pm in Utah it
+  // returned tomorrow's date as the default date of service.
   const d = new Date();
-  return d.toISOString().slice(0, 10);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
 function fmtDate(iso) {
@@ -1222,12 +1234,12 @@ function render() {
   // time this shows (see ensureFreshToken), so this is the one-tap
   // fallback instead of having to notice sync stopped and go find
   // Settings → Connect on your own.
-  const needsReconnect = !state._driveToken && state._clientId && SYNC_QUEUE.length && state.view !== "settings";
+  const needsReconnect = !state._m365Token && SYNC_QUEUE.length && state.view !== "settings";
   const missingCount = (state.missingIds || []).length;
   const syncBanner = needsReconnect
-    ? `<div class="sync-banner" id="syncBanner">⚠️ ${SYNC_QUEUE.length} case(s) waiting to sync — tap to reconnect Google Drive</div>`
+    ? `<div class="sync-banner" id="syncBanner">⚠️ ${SYNC_QUEUE.length} case(s) waiting to sync — tap to reconnect Microsoft 365</div>`
     : missingCount && state.view !== "settings"
-    ? `<div class="sync-banner" id="missingBanner">⚠️ ${missingCount} case(s) on this phone aren't on the sheet — tap to review</div>`
+    ? `<div class="sync-banner" id="missingBanner">⚠️ ${missingCount} case(s) on this phone aren't in the workbook — tap to review</div>`
     : "";
 
   app.innerHTML = `<div class="screen">${syncBanner}${body}</div>${tab}${state.codePicker ? renderCodePicker() : ""}${state.cropSource ? renderCropModal() : ""}${state.liveScanOpen ? renderLiveScanModal() : ""}`;
@@ -1377,29 +1389,24 @@ function renderCaseCard(c) {
 }
 
 function renderSettings() {
-  const driveConnected = !!state._driveToken;
   return `
     <header class="topbar"><h1>Settings</h1></header>
     <div class="content">
       <section class="card">
-        <h2>Google Drive sync</h2>
-        <p class="muted">Every saved case backs up automatically to a spreadsheet called <strong>${SHEET_NAME}</strong> in your Google Drive — primary/co-surgeon cases on one tab, assistant cases on another, plus a Monthly Tally tab that auto-counts Bariatric/EGD/Back/General Surgery/Tummy Tuck cases per month, with Non-Op Consults (consult codes only, no procedure) counted separately and listed on their own Non-Op Consults tab. Data goes only to your own Google account — no other server is involved.</p>
-        <div class="field">
-          <label>Google OAuth Client ID</label>
-          <input id="f_clientId" type="text" value="${escapeHtml(state._clientId || "")}" placeholder="xxxx.apps.googleusercontent.com" />
-        </div>
-        <button id="saveClientIdBtn" class="secondary-btn">Save client ID</button>
-        <button id="driveConnectBtn" class="secondary-btn" ${state._clientId ? "" : "disabled"}>
-          ${driveConnected ? "✓ Connected — reconnect" : "Connect Google Drive"}
+        <h2>Microsoft 365 sync</h2>
+        <p class="muted">Every saved case is written to the Excel workbook <strong>${WORKBOOK_FOLDER}/${WORKBOOK_FILE}</strong> in your OneDrive (practice Microsoft 365 account), newest cases at the top. Primary/co-surgeon, assistant and non-op consult cases each have their own tab, plus All Cases and a Monthly Tally. Data goes only to your practice's Microsoft 365. No other server is involved.</p>
+        ${state._m365Account ? `<p class="hint">Signed in as <strong>${escapeHtml(state._m365Account)}</strong>${state._m365Token ? "" : " (sign-in expired; tap Reconnect)"}</p>` : ""}
+        <button id="driveConnectBtn" class="secondary-btn">
+          ${state._m365Account ? (state._m365Token ? "✓ Connected — reconnect" : "Reconnect Microsoft 365") : "Connect Microsoft 365"}
         </button>
-        ${!state._clientId ? '<p class="hint">Set up a Client ID in Google Cloud Console — see README.md. Everything else in the app works without this.</p>' : ""}
+        ${state._m365Account ? '<button id="signOutBtn" class="secondary-btn">Sign out</button>' : ""}
         ${SYNC_QUEUE.length ? `<p class="hint">${SYNC_QUEUE.length} case(s) queued to sync once connected/online.</p>` : ""}
       </section>
 
       <section class="card" id="missingCard">
-        <h2>Missing from the sheet</h2>
-        <p class="muted">Compares every case saved on this phone with the ${SHEET_NAME} spreadsheet and lists any that never made it there.</p>
-        <button id="reconcileBtn" class="secondary-btn" ${state.reconcileBusy || !state._clientId ? "disabled" : ""}>
+        <h2>Missing from the workbook</h2>
+        <p class="muted">Compares every case saved on this phone with the ${WORKBOOK_FILE} workbook and lists any that never made it there.</p>
+        <button id="reconcileBtn" class="secondary-btn" ${state.reconcileBusy || !state._m365Account ? "disabled" : ""}>
           ${state.reconcileBusy ? "Checking…" : "Check for missing cases"}
         </button>
         ${(state.missingIds || []).length ? `
@@ -1413,20 +1420,22 @@ function renderSettings() {
               </label>`;
             }).join("")}
           </div>
-          <button id="addMissingBtn" class="primary-btn" ${state.reconcileBusy || !state.missingSelected.size ? "disabled" : ""}>Add ${state.missingSelected.size} to sheet</button>
-          <p class="hint">Uncheck anything you don't want on the sheet (e.g. old test cases).</p>
-        ` : state.reconcileCheckedAt ? `<p class="hint">✓ Last check: everything on this phone is on the sheet.</p>` : ""}
+          <button id="addMissingBtn" class="primary-btn" ${state.reconcileBusy || !state.missingSelected.size ? "disabled" : ""}>Add ${state.missingSelected.size} to workbook</button>
+          <p class="hint">Uncheck anything you don't want in the workbook (e.g. old test cases).</p>
+        ` : state.reconcileCheckedAt ? `<p class="hint">✓ Last check: everything on this phone is in the workbook.</p>` : ""}
       </section>
 
       <section class="card">
         <h2>Code library</h2>
-        <p class="muted">${CPT_LIB.length} CPT · ${ICD10_LIB.length} ICD-10 codes. Add, edit, or remove codes any time — changes are saved on this device immediately, no redeploy needed.</p>
+        <p class="muted">${CPT_LIB.length} CPT · ${ICD10_LIB.length} ICD-10 codes. Changes are saved on this phone right away and backed up to the <strong>Code Library</strong> tab of your workbook, so app updates can't erase them. Codes you add on that tab in Excel show up here too.</p>
+        <p class="hint">${state.codeLibPending ? `${state.codeLibPending} change(s) waiting to back up.` : state.codeLibSyncedAt ? `✓ Backed up ${new Date(state.codeLibSyncedAt).toLocaleString()}` : state._m365Account ? "Not backed up yet." : "Connect Microsoft 365 to back up your codes."}</p>
         <button class="secondary-btn" data-nav="library">Manage code library</button>
+        <button id="codeSyncBtn" class="secondary-btn" ${state.codeLibBusy || !state._m365Account ? "disabled" : ""}>${state.codeLibBusy ? "Syncing…" : "Sync code library now"}</button>
       </section>
 
       <section class="card">
         <h2>About</h2>
-        <p class="muted">ChargeCap v1.13 · ${CASES.length} case(s) stored locally on this device (IndexedDB).</p>
+        <p class="muted">ChargeCap v2.1 · ${CASES.length} case(s) stored locally on this device (IndexedDB).</p>
         <p class="muted small">CPT/ICD-10 favorites were imported from your OR billing sheets — double-check codes against current documentation before relying on them for claims.</p>
       </section>
     </div>`;
@@ -1625,7 +1634,7 @@ function bindEvents() {
   );
 
   const syncBannerEl = document.getElementById("syncBanner");
-  if (syncBannerEl) syncBannerEl.addEventListener("click", connectGoogleDrive);
+  if (syncBannerEl) syncBannerEl.addEventListener("click", connectM365);
   const missingBannerEl = document.getElementById("missingBanner");
   if (missingBannerEl) missingBannerEl.addEventListener("click", () => {
     state.view = "settings";
@@ -1810,16 +1819,12 @@ function bindCasesEvents() {
 }
 
 function bindSettingsEvents() {
-  const saveBtn = document.getElementById("saveClientIdBtn");
-  if (saveBtn) saveBtn.addEventListener("click", async () => {
-    const val = document.getElementById("f_clientId").value.trim();
-    state._clientId = val;
-    await setMeta("googleClientId", val);
-    toast("Client ID saved");
-    render();
-  });
   const connectBtn = document.getElementById("driveConnectBtn");
-  if (connectBtn) connectBtn.addEventListener("click", connectGoogleDrive);
+  if (connectBtn) connectBtn.addEventListener("click", connectM365);
+  const signOutBtn = document.getElementById("signOutBtn");
+  if (signOutBtn) signOutBtn.addEventListener("click", signOutM365);
+  const codeSyncBtn = document.getElementById("codeSyncBtn");
+  if (codeSyncBtn) codeSyncBtn.addEventListener("click", () => syncCodeLibrary({ manual: true }));
   const reconcileBtn = document.getElementById("reconcileBtn");
   if (reconcileBtn) reconcileBtn.addEventListener("click", () => reconcileWithSheet({ manual: true }));
   const addMissingBtn = document.getElementById("addMissingBtn");
@@ -2048,441 +2053,511 @@ function caseToRow(c) {
 }
 
 // ---------------------------------------------------------------------
-// Google Drive sync (OAuth via Google Identity Services + Sheets API)
+// Microsoft 365 sync (v2.0) — MSAL.js sign-in + Microsoft Graph Excel API
 // ---------------------------------------------------------------------
+// Every saved case is written to an Excel workbook in the user's own
+// OneDrive for Business: /ChargeCap/ChargeCap Log.xlsx. This replaces
+// the Google Identity Services + Sheets API code from v1.x so the PHI
+// stays inside the practice's Microsoft 365 tenant (covered by its BAA).
+//
+// Row order (v2.0): NEWEST FIRST. A new case is inserted at its date
+// position — above every row with the same or an older date — so the
+// most recent cases are always at the top. Because inserts shift every
+// row below, a stored row number is only a hint: each sync re-reads the
+// tab and finds the case by date of service + MRN (or name), with the
+// CPT list and the old row number breaking ties (see findCaseInTabs).
 
-let tokenClient = null;
+const M365_CLIENT_ID = "8296bb04-e9c9-482a-a6a8-9d141b25e85d";
+const M365_TENANT_ID = "3602a33d-51c9-4967-bcfa-5dba0f27735b";
+const GRAPH_SCOPES = ["User.Read", "Files.ReadWrite"];
+const GRAPH = "https://graph.microsoft.com/v1.0";
+const WORKBOOK_FOLDER = "ChargeCap";
+const WORKBOOK_FILE = "ChargeCap Log.xlsx";
+// Blank workbook (tabs, headers, column formats, month-break formatting)
+// shipped with the app. Used only if the workbook doesn't exist yet in
+// OneDrive. Contains no patient data.
+const WORKBOOK_TEMPLATE_URL = "chargecap-template.xlsx";
 
-// Access tokens from Google's implicit/token-client flow expire (~1hr)
-// and there's no refresh token in this browser-only flow — that's
-// inherent to the security model, not something we can change. What WAS
-// a bug: state._driveToken only ever lived in memory, never written to
-// IndexedDB, so it was lost on every app restart (and on iOS a PWA's JS
-// gets evicted from memory constantly just from backgrounding), forcing
-// a manual "Connect" in Settings far more often than the token's actual
-// 1hr lifetime should require. Fixed by persisting the token alongside
-// its expiry and restoring it on boot (see restoreDriveToken()), plus
-// attempting a silent (no-UI) reauth via prompt:"" before falling back
-// to asking the user to tap reconnect.
-let pendingTokenResolvers = [];
-let silentAttemptInFlight = false;
+let msalApp = null;
+let msalReady = null; // Promise, resolves once MSAL has processed any redirect
 
-function initGoogleAuth() {
-  if (!state._clientId || !window.google) return;
-  tokenClient = google.accounts.oauth2.initTokenClient({
-    client_id: state._clientId,
-    scope: SHEETS_SCOPE,
-    callback: async (resp) => {
-      const resolvers = pendingTokenResolvers.splice(0);
-      const wasSilent = silentAttemptInFlight;
-      silentAttemptInFlight = false;
-      if (resp.error) {
-        // A silent (background) attempt failing is expected whenever
-        // there's no live Google session to reuse — that's not an error
-        // worth interrupting the user for. Only a user-initiated
-        // "Connect"/"reconnect" tap surfaces a toast on failure.
-        if (!wasSilent) toast("Google sign-in failed", true);
-        resolvers.forEach((r) => r(false));
-        return;
+function initMsal() {
+  if (msalReady) return msalReady;
+  msalReady = (async () => {
+    if (!window.msal) return false;
+    msalApp = new msal.PublicClientApplication({
+      auth: {
+        clientId: M365_CLIENT_ID,
+        authority: `https://login.microsoftonline.com/${M365_TENANT_ID}`,
+        // Must match the SPA redirect URI registered in Entra exactly.
+        redirectUri: location.origin + "/",
+        navigateToLoginRequestUrl: false,
+      },
+      // localStorage so the sign-in survives the app being closed (an
+      // iOS home-screen app is unloaded from memory constantly).
+      cache: { cacheLocation: "localStorage" },
+    });
+    await msalApp.initialize();
+    try {
+      const resp = await msalApp.handleRedirectPromise();
+      if (resp && resp.account) {
+        msalApp.setActiveAccount(resp.account);
+        state._m365Account = resp.account.username;
+        toast("Microsoft 365 connected");
       }
-      state._driveToken = resp.access_token;
-      const expiresAt = Date.now() + (resp.expires_in || 3600) * 1000;
-      await setMeta("driveToken", resp.access_token);
-      await setMeta("driveTokenExpiry", expiresAt);
-      if (!wasSilent) toast("Google Drive connected");
-      render();
-      resolvers.forEach((r) => r(true));
-      flushSyncQueue();
-    },
-    // v1.12: GIS reports popup failures (blocked / closed / failed to
-    // open — common for a silent attempt inside an iOS home-screen app)
-    // ONLY through error_callback, never through callback above. Without
-    // this, the pending promise in requestToken() never settled and any
-    // sync waiting on it hung forever — the case was never queued, no
-    // banner, no toast. That is how cases from 10/3–10/15 silently
-    // never reached the sheet.
-    error_callback: () => {
-      const resolvers = pendingTokenResolvers.splice(0);
-      silentAttemptInFlight = false;
-      resolvers.forEach((r) => r(false));
-    },
-  });
+    } catch (err) {
+      console.error(err);
+      toast("Microsoft sign-in didn't finish — tap Connect to try again", true);
+    }
+    const acct = msalApp.getActiveAccount() || msalApp.getAllAccounts()[0];
+    if (acct) {
+      msalApp.setActiveAccount(acct);
+      state._m365Account = acct.username;
+    }
+    return true;
+  })();
+  return msalReady;
 }
 
-// Restores a still-valid token from IndexedDB on boot so the app doesn't
-// need to re-authenticate every time it's relaunched — only once the
-// token has actually expired.
-async function restoreDriveToken() {
-  const token = await getMeta("driveToken", null);
-  const expiresAt = await getMeta("driveTokenExpiry", 0);
-  if (token && Date.now() < expiresAt - 60 * 1000) {
-    state._driveToken = token;
-  }
+// User-initiated connect/reconnect (Settings button, sync banner tap).
+// Uses a full-page redirect rather than a popup: popups don't work
+// reliably inside an iOS home-screen app (that is what broke the Google
+// version's silent sign-in). The app reloads afterwards; every case is
+// already saved in IndexedDB, so nothing in progress is lost.
+async function connectM365() {
+  if (!(await initMsal())) { toast("Microsoft sign-in isn't available offline", true); return; }
+  const account = msalApp.getActiveAccount();
+  const req = { scopes: GRAPH_SCOPES };
+  if (account) await msalApp.acquireTokenRedirect({ ...req, account });
+  else await msalApp.loginRedirect({ ...req, prompt: "select_account" });
 }
 
-// Wraps tokenClient.requestAccessToken() in a Promise. silent:true uses
-// prompt:"" (no popup/consent UI — succeeds only if Google can reissue a
-// token without asking the user anything; fails quietly otherwise).
+async function signOutM365() {
+  if (!(await initMsal())) return;
+  const account = msalApp.getActiveAccount();
+  // Clears this app's sign-in only — doesn't sign the phone out of
+  // Microsoft everywhere, and doesn't touch any saved case.
+  if (account) await msalApp.clearCache({ account });
+  state._m365Token = null;
+  state._m365Account = null;
+  await setMeta("workbookItemId", null);
+  toast("Signed out of Microsoft 365 on this app");
+  render();
+}
+
+// Returns an access token without any UI, or null (caller queues the
+// case and shows the reconnect banner). MSAL caches the ~1hr access
+// token and refreshes it with its refresh token. Microsoft limits a web
+// app's refresh token to 24 hours, so expect one "tap to reconnect" a
+// day; that tap normally goes straight back without asking for a
+// password.
 const TOKEN_REQUEST_TIMEOUT_MS = 20000;
-function requestToken({ silent = false } = {}) {
-  return new Promise((resolve) => {
-    if (!tokenClient) { resolve(false); return; }
-    // Belt and braces with error_callback above: if Google never answers
-    // at all, give up after TOKEN_REQUEST_TIMEOUT_MS (silent attempts
-    // only — a manual sign-in can legitimately take longer) so the
-    // caller falls through to queue + reconnect banner instead of hanging.
-    let settled = false;
-    const done = (ok) => { if (!settled) { settled = true; resolve(ok); } };
-    pendingTokenResolvers.push(done);
-    if (silent) {
-      setTimeout(() => {
-        const i = pendingTokenResolvers.indexOf(done);
-        if (i >= 0) pendingTokenResolvers.splice(i, 1);
-        if (!settled) silentAttemptInFlight = false;
-        done(false);
-      }, TOKEN_REQUEST_TIMEOUT_MS);
-    }
-    if (silent) silentAttemptInFlight = true;
-    // Silent: prompt:"" — no UI, succeeds only if Google can reissue
-    // without asking anything. Manual: no override, same as before —
-    // let Google show the minimum it needs (often just an instant
-    // account-picker tap for a previously-granted user, not a full
-    // consent screen every time).
-    tokenClient.requestAccessToken(silent ? { prompt: "" } : {});
-  });
-}
-
-// Google's GSI script (accounts.google.com/gsi/client) loads async over
-// the network — on a fresh app launch it's often not ready yet even
-// though app.js already is. Anything that needs tokenClient waits for
-// it here first instead of silently no-op'ing.
-function waitForGoogleIdentity(timeoutMs = 15000, intervalMs = 250) {
-  return new Promise((resolve) => {
-    if (window.google && window.google.accounts && window.google.accounts.oauth2) { resolve(true); return; }
-    const start = Date.now();
-    const id = setInterval(() => {
-      if (window.google && window.google.accounts && window.google.accounts.oauth2) {
-        clearInterval(id);
-        resolve(true);
-      } else if (Date.now() - start > timeoutMs) {
-        clearInterval(id);
-        resolve(false);
-      }
-    }, intervalMs);
-  });
-}
-
-// Explicit, user-initiated connect/reconnect (Settings button, sync
-// banner tap). Always shows the Google UI so it works even the very
-// first time, before any session/consent exists to reuse silently.
-async function connectGoogleDrive() {
-  if (!state._clientId) { toast("Add a Client ID first", true); return; }
-  if (!tokenClient) {
-    if (!(await waitForGoogleIdentity(5000))) {
-      toast("Google sign-in isn't ready yet — try again in a moment", true);
-      return;
-    }
-    initGoogleAuth();
+async function getGraphToken({ forceRefresh = false } = {}) {
+  if (!(await initMsal())) return null;
+  const account = msalApp.getActiveAccount();
+  if (!account) return null;
+  try {
+    const resp = await Promise.race([
+      msalApp.acquireTokenSilent({ scopes: GRAPH_SCOPES, account, forceRefresh }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("token-timeout")), TOKEN_REQUEST_TIMEOUT_MS)),
+    ]);
+    state._m365Token = resp.accessToken;
+    return resp.accessToken;
+  } catch (err) {
+    console.warn("Silent token failed", err && (err.errorCode || err.message));
+    state._m365Token = null;
+    return null;
   }
-  if (!tokenClient) { toast("Add a Client ID first", true); return; }
-  requestToken({ silent: false });
 }
 
-// Called before anything that needs Drive access. Returns true if
-// state._driveToken is set and good to use — reusing the persisted
-// token when it's still valid, otherwise trying a silent reauth first
-// so most syncs never need a tap at all. Only returns false (caller
-// should queue + show the reconnect banner) when even that fails,
-// which mainly happens after ~1hr idle with no live Google session to
-// reuse, or before the very first connect.
 async function ensureFreshToken() {
-  const expiresAt = await getMeta("driveTokenExpiry", 0);
-  if (state._driveToken && Date.now() < expiresAt - 60 * 1000) return true;
-  if (!state._clientId) return false;
-  if (!tokenClient) initGoogleAuth();
-  if (!tokenClient) return false;
-  return requestToken({ silent: true });
+  return !!(await getGraphToken());
 }
 
-async function driveFetch(url, opts = {}) {
-  if (!state._driveToken) throw new Error("not-connected");
-  return fetch(url, {
-    ...opts,
-    headers: { ...(opts.headers || {}), Authorization: `Bearer ${state._driveToken}` },
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// fetch() wrapper for Graph: adds the token, retries once after a 401
+// (with a forced token refresh) and up to three times on throttling /
+// "workbook busy" responses, and throws on any other non-2xx so a failed
+// write can never be mistaken for a success.
+async function graphFetch(path, opts = {}, attempt = 0) {
+  const token = await getGraphToken({ forceRefresh: attempt > 0 && opts._after401 });
+  if (!token) throw new Error("not-connected");
+  const url = path.startsWith("http") ? path : GRAPH + path;
+  const res = await fetch(url, {
+    method: opts.method || "GET",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      ...(opts.body && !(opts.body instanceof Blob) && !(opts.body instanceof ArrayBuffer) ? { "Content-Type": "application/json" } : {}),
+      ...(opts.headers || {}),
+    },
+    body: opts.body,
   });
-}
-
-// driveFetch() only rejects on a network-level failure — a 400/403/etc.
-// HTTP response still resolves normally, so callers that don't check
-// res.ok can silently treat a failed write as a success (this is how
-// the "All Cases"/"Monthly Tally" formulas ended up never actually
-// written: the setup call failed server-side but ensureTabs() marked
-// itself done anyway and never retried). Use this wrapper for any
-// Sheets/Drive write whose success matters.
-async function driveFetchOk(url, opts = {}, _retried = false) {
-  const res = await driveFetch(url, opts);
-  // A stored token can go stale mid-session (revoked, or our expiry
-  // estimate was slightly optimistic) — a 401 here means Google itself
-  // rejected it, not just our local clock. Try one silent reauth + retry
-  // before giving up, so an in-progress sync recovers on its own instead
-  // of surfacing an avoidable failure.
-  if (res.status === 401 && !_retried) {
-    state._driveToken = null;
-    const refreshed = await requestToken({ silent: true });
-    if (refreshed) return driveFetchOk(url, opts, true);
+  if (res.status === 401 && !opts._after401) return graphFetch(path, { ...opts, _after401: true }, attempt + 1);
+  if ([429, 503, 504, 409].includes(res.status) && attempt < 3) {
+    const wait = Math.min(Number(res.headers.get("Retry-After")) * 1000 || 1500 * (attempt + 1), 10000);
+    await sleep(wait);
+    return graphFetch(path, opts, attempt + 1);
   }
   if (!res.ok) {
     let detail = "";
     try { detail = JSON.stringify((await res.json()).error || {}); } catch { /* ignore */ }
-    throw new Error(`Sheets API ${res.status} on ${url.split("?")[0]}: ${detail}`);
+    const err = new Error(`Graph ${res.status} on ${url.split("?")[0]}: ${detail}`);
+    err.status = res.status;
+    throw err;
   }
   return res;
 }
+const graphJson = async (path, opts) => (await graphFetch(path, opts)).json();
 
-async function findOrCreateSheet() {
-  const cachedId = await getMeta("sheetId", null);
-  if (cachedId) return cachedId;
-
-  const q = encodeURIComponent(`name='${SHEET_NAME}' and mimeType='application/vnd.google-apps.spreadsheet' and trashed=false`);
-  const listRes = await driveFetchOk(`https://www.googleapis.com/drive/v3/files?q=${q}&fields=files(id,name)`);
-  const listJson = await listRes.json();
-  if (listJson.files && listJson.files.length) {
-    await setMeta("sheetId", listJson.files[0].id);
-    return listJson.files[0].id;
-  }
-
-  const createRes = await driveFetchOk("https://sheets.googleapis.com/v4/spreadsheets", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ properties: { title: SHEET_NAME } }),
-  });
-  const createJson = await createRes.json();
-  const sheetId = createJson.spreadsheetId;
-  await setMeta("sheetId", sheetId);
-  return sheetId;
-}
-
-// Bump whenever the tab/formula structure changes (e.g. adding a new
-// tally category) so an already-connected user's spreadsheet picks up
-// the new columns/formulas automatically on their next sync, instead of
-// staying stuck with whatever schema existed when they first connected.
-// Mirrors DB_VERSION's self-repair pattern above. "tabsReady" used to
-// store a plain `true`; comparing with >= still does the right thing
-// for a legacy `true` value (coerces to 1, which is < any bumped
-// version here) so old installs re-run this once automatically.
-//
-// v3: added the "Tummy Tuck" tally category (CPT 15830/15847) and,
-// separately, fixed a real bug from v2 — the setup calls below weren't
-// checked for failure, so a rejected write (e.g. a malformed request)
-// could still mark tabsReady done and permanently skip the "All Cases"/
-// "Monthly Tally" formulas. Bumping the version forces everyone to
-// redo this once with the fix in place.
-// v4: removed the "Surgeon" column (redundant with Role) — sheet is now
-// 15 columns (A-O) instead of 16 (A-P). Rewriting headers/formulas here
-// only fixes the TOP of the sheet (header row + tally); it does NOT
-// re-shift any data rows already written under the old 16-column
-// layout. Existing rows must be migrated by hand — see README.
-// v5 (2026-09-16): Monthly Tally was counting every case in "All Cases"
-// — which deliberately includes Assistant-role cases too, for the
-// combined log — so assist cases were inflating the user's own tally.
-// Monthly Tally's A2/B2:F2 formulas now read from "Primary & Co-Surgeon"
-// only. Bumping the version so an already-connected install picks up
-// the corrected formulas on next sync instead of keeping the old ones
-// (the live spreadsheet was also hand-fixed directly on 2026-09-16 —
-// this bump just makes sure a fresh ensureTabs() run agrees with it).
-// v6 (2026-09-23): added the "Non-Op Consults" tally column (H) — cases
-// whose only CPT codes are consult/E&M codes (see CONSULT_CPT). Placed
-// AFTER Total on purpose: Total (G) stays the operative-case count and
-// does NOT include consults. Also re-tags any already-synced consult-only
-// rows' Category cell (column O) from "General Surgery" to
-// "Non-Op Consult" — see retagNonOpRows().
-// v7 (2026-10-16): added the "Non-Op Consults" tab (TAB_CONSULTS).
-// v8 (2026-10-16): Non-Op Consults becomes a real data tab (no formula);
-// All Cases stacks all three data tabs; Tally months + column H read it.
-const TABS_SCHEMA_VERSION = 8;
-
-// Makes sure the four tabs (Primary & Co-Surgeon, Assistant, All Cases,
-// Monthly Tally) exist with headers + formulas in place, and that the
-// Monthly Tally formulas match TABS_SCHEMA_VERSION. Runs once per schema
-// version (tracked via the "tabsReady" meta flag) and is safe to re-run
-// — it only adds what's missing, and every Monthly Tally cell is always
-// a live formula anyway, so overwriting them in place is harmless (see
-// TABS_SCHEMA_VERSION above).
-async function ensureTabs(sheetId) {
-  const readyVersion = await getMeta("tabsReady", 0);
-  if (readyVersion >= TABS_SCHEMA_VERSION) return;
-
-  const metaRes = await driveFetchOk(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=sheets.properties`);
-  const metaJson = await metaRes.json();
-  const sheets = metaJson.sheets || [];
-  const existingTitles = sheets.map((s) => s.properties.title);
-  const requests = [];
-
-  if (!existingTitles.includes(TAB_PRIMARY)) {
-    // Rename Google's auto-created default tab (usually "Sheet1") to our
-    // first data tab instead of leaving an empty orphan tab behind —
-    // but only if that default tab isn't already one of ours.
-    const firstSheet = sheets[0];
-    if (firstSheet && !ALL_TABS.includes(firstSheet.properties.title)) {
-      requests.push({
-        updateSheetProperties: {
-          properties: { sheetId: firstSheet.properties.sheetId, title: TAB_PRIMARY },
-          fields: "title",
-        },
-      });
-    } else {
-      requests.push({ addSheet: { properties: { title: TAB_PRIMARY } } });
+// Runs several Graph requests in one round trip, strictly in order
+// (each depends on the one before). Throws if any of them failed.
+async function graphBatch(reqs) {
+  const requests = reqs.map((r, i) => ({
+    id: String(i + 1),
+    method: r.method,
+    url: r.url,
+    ...(r.body !== undefined ? { body: r.body, headers: { "Content-Type": "application/json" } } : {}),
+    ...(i ? { dependsOn: [String(i)] } : {}),
+  }));
+  const json = await graphJson("/$batch", { method: "POST", body: JSON.stringify({ requests }) });
+  const byId = Object.fromEntries((json.responses || []).map((r) => [r.id, r]));
+  for (const r of requests) {
+    const resp = byId[r.id];
+    if (!resp || resp.status < 200 || resp.status >= 300) {
+      throw new Error(`Graph batch step ${r.id} (${r.method} ${r.url.split("?")[0]}) failed: ${resp ? resp.status + " " + JSON.stringify(resp.body && resp.body.error || {}) : "no response"}`);
     }
   }
-  [TAB_ASSISTANT, TAB_ALL, TAB_TALLY, TAB_CONSULTS].forEach((title) => {
-    if (!existingTitles.includes(title)) requests.push({ addSheet: { properties: { title } } });
-  });
+  return requests.map((r) => byId[r.id].body);
+}
 
-  if (requests.length) {
-    sheetMetaCache = null;
-    await driveFetchOk(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ requests }),
+// ---- Workbook location ----------------------------------------------
+
+async function findOrCreateWorkbook() {
+  const cachedId = await getMeta("workbookItemId", null);
+  if (cachedId) return cachedId;
+  const path = `/me/drive/root:/${encodeURIComponent(WORKBOOK_FOLDER)}/${encodeURIComponent(WORKBOOK_FILE)}`;
+  let item = null;
+  try {
+    item = await graphJson(`${path}?$select=id,name`);
+  } catch (err) {
+    if (err.status !== 404) throw err;
+  }
+  if (!item) {
+    // Not there yet: upload the blank template (creates the ChargeCap
+    // folder too). conflictBehavior=fail so this can never overwrite a
+    // workbook that appeared in the meantime.
+    const tpl = await fetch(WORKBOOK_TEMPLATE_URL, { cache: "no-store" });
+    if (!tpl.ok) throw new Error("Couldn't load the blank workbook template");
+    item = await graphJson(`${path}:/content?@microsoft.graph.conflictBehavior=fail`, {
+      method: "PUT",
+      body: await tpl.arrayBuffer(),
+      headers: { "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
     });
   }
+  await setMeta("workbookItemId", item.id);
+  return item.id;
+}
 
-  // Header rows + the formulas that drive "All Cases" and "Monthly Tally".
-  // USER_ENTERED (not RAW) so date strings like "8/27/2026" get parsed
-  // into real Sheets dates — the tally's date-range math depends on that.
-  //
-  // Monthly Tally counts ONLY Primary & Co-Surgeon cases — it must not
-  // read from "All Cases" (which deliberately also includes Assistant-role
-  // cases, for the full combined log view). tallyDateRange therefore
-  // points at TAB_PRIMARY, not TAB_ALL, even though TAB_ASSISTANT-role
-  // cases never appear in TAB_PRIMARY in the first place (see
-  // tabForRole()), so no separate role filter is needed on top of this.
-  const allDateRange = `'${TAB_ALL}'!A2:A5000`;
-  const tallyDateRange = `'${TAB_PRIMARY}'!A2:A5000`;
-  await driveFetchOk(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values:batchUpdate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      valueInputOption: "USER_ENTERED",
-      data: [
-        { range: `'${TAB_PRIMARY}'!A1:O1`, values: [SHEET_HEADER] },
-        { range: `'${TAB_ASSISTANT}'!A1:O1`, values: [SHEET_HEADER] },
-        { range: `'${TAB_ALL}'!A1:O1`, values: [SHEET_HEADER] },
-        { range: `'${TAB_CONSULTS}'!A1:O1`, values: [SHEET_HEADER] },
-        {
-          // Stacks all three data tabs into one sorted-by-date log (blank
-          // rows filtered out) — this tab is NOT what the tally counts
-          // from (see tallyDateRange above).
-          range: `'${TAB_ALL}'!A2`,
-          values: [[`=SORT(FILTER({'${TAB_PRIMARY}'!A2:O5000;'${TAB_ASSISTANT}'!A2:O5000;'${TAB_CONSULTS}'!A2:O5000},{'${TAB_PRIMARY}'!A2:A5000;'${TAB_ASSISTANT}'!A2:A5000;'${TAB_CONSULTS}'!A2:A5000}<>""),1,TRUE)`]],
-        },
-        {
-          range: `'${TAB_TALLY}'!A1:H1`,
-          values: [["Month", "Bariatric", "EGD", "Back", "General Surgery", "Tummy Tuck", "Total", "Non-Op Consults"]],
-        },
-        {
-          // One first-of-month row per month that actually has a
-          // Primary/Co-Surgeon case, newest formulas spill down
-          // automatically as rows are added.
-          // v8: months come from Primary AND Non-Op Consults, so a month
-          // with only consults still gets a row.
-          range: `'${TAB_TALLY}'!A2`,
-          values: [[`=SORT(UNIQUE(FILTER(EOMONTH({${tallyDateRange};'${TAB_CONSULTS}'!A2:A5000},-1)+1,{${tallyDateRange};'${TAB_CONSULTS}'!A2:A5000}<>"")))`]],
-        },
-        {
-          range: `'${TAB_TALLY}'!B2`,
-          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_PRIMARY}'!$A$2:$A$5000,">="&A2:A,'${TAB_PRIMARY}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_PRIMARY}'!$O$2:$O$5000,"Bariatric")))`]],
-        },
-        {
-          range: `'${TAB_TALLY}'!C2`,
-          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_PRIMARY}'!$A$2:$A$5000,">="&A2:A,'${TAB_PRIMARY}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_PRIMARY}'!$O$2:$O$5000,"EGD")))`]],
-        },
-        {
-          range: `'${TAB_TALLY}'!D2`,
-          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_PRIMARY}'!$A$2:$A$5000,">="&A2:A,'${TAB_PRIMARY}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_PRIMARY}'!$O$2:$O$5000,"Back")))`]],
-        },
-        {
-          range: `'${TAB_TALLY}'!E2`,
-          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_PRIMARY}'!$A$2:$A$5000,">="&A2:A,'${TAB_PRIMARY}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_PRIMARY}'!$O$2:$O$5000,"General Surgery")))`]],
-        },
-        {
-          range: `'${TAB_TALLY}'!F2`,
-          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_PRIMARY}'!$A$2:$A$5000,">="&A2:A,'${TAB_PRIMARY}'!$A$2:$A$5000,"<"&EDATE(A2:A,1),'${TAB_PRIMARY}'!$O$2:$O$5000,"Tummy Tuck")))`]],
-        },
-        { range: `'${TAB_TALLY}'!G2`, values: [[`=ARRAYFORMULA(IF(A2:A="","",B2:B+C2:C+D2:D+E2:E+F2:F))`]] },
-        {
-          range: `'${TAB_TALLY}'!H2`,
-          // v8: counts every row on the Non-Op Consults tab for the month.
-          values: [[`=ARRAYFORMULA(IF(A2:A="","",COUNTIFS('${TAB_CONSULTS}'!$A$2:$A$5000,">="&A2:A,'${TAB_CONSULTS}'!$A$2:$A$5000,"<"&EDATE(A2:A,1))))`]],
-        },
-      ],
-    }),
+const wbPath = (itemId) => `/me/drive/items/${itemId}/workbook`;
+const wsPath = (itemId, tab) => `${wbPath(itemId)}/worksheets('${encodeURIComponent(tab.replace(/'/g, "''"))}')`;
+const rangePath = (itemId, tab, addr) => `${wsPath(itemId, tab)}/range(address='${addr}')`;
+
+// ---- Formulas (All Cases + Monthly Tally) ---------------------------
+// The formulas live IN the workbook file (ChargeCap Log.xlsx and
+// chargecap-template.xlsx are built with them), so the app normally
+// never writes them. They are only (re)written here if one of those two
+// tabs is missing, e.g. deleted by hand. Keep these in step with
+// build_workbook.py.
+const WB_SCHEMA_VERSION = 3;
+// Every reference into a data tab starts at ROW 1 (the header): the app
+// inserts new cases at row 2, and Excel shifts (rather than grows) a
+// range whose first row is the insert point.
+const FORMULA_ROWS = 20000;
+const TALLY_ROWS = 240; // 20 years of months
+
+function q(tab) { return `'${tab.replace(/'/g, "''")}'`; }
+
+// All Cases (ordinary formulas, no dynamic arrays, so it works in any
+// Excel): merges the three newest-first data tabs row by row. Hidden
+// columns: Q/R/S = next unread row on each tab, T = tab chosen for this
+// row, U/V/W = those rows' dates; Q1/R1/S1 = rows on each tab.
+const ALL_CASES_ROWS = 5000;
+function allCasesCounts() {
+  const N = FORMULA_ROWS;
+  return [q(TAB_PRIMARY), q(TAB_ASSISTANT), q(TAB_CONSULTS)].map(
+    (t) => `=IFERROR(LOOKUP(2,1/(${t}!$A$1:$A$${N}<>""),ROW(${t}!$A$1:$A$${N})-1),0)`
+  );
+}
+// Returns 23 formulas for columns A..W (P, index 15, left empty).
+function allCasesRowFormulas(r) {
+  const N = FORMULA_ROWS;
+  const tabs = [q(TAB_PRIMARY), q(TAB_ASSISTANT), q(TAB_CONSULTS)];
+  const out = new Array(23).fill("");
+  "QRS".split("").forEach((col, k) => {
+    out[16 + k] = r === 2 ? "=1" : `=${col}${r - 1}+($T${r - 1}=${k + 1})`;
+    out[20 + k] = `=IF(${col}${r}>$${col}$1,-1,N(INDEX(${tabs[k]}!$A$1:$A$${N},${col}${r}+1)))`;
   });
+  out[19] = `=IF(MAX(U${r}:W${r})<0,0,MATCH(MAX(U${r}:W${r}),U${r}:W${r},0))`;
+  "ABCDEFGHIJKLMNO".split("").forEach((L, c) => {
+    const cell = `INDEX(CHOOSE($T${r},${tabs[0]}!${L}$1:${L}$${N},${tabs[1]}!${L}$1:${L}$${N},${tabs[2]}!${L}$1:${L}$${N}),CHOOSE($T${r},$Q${r},$R${r},$S${r})+1)`;
+    out[c] = `=IF($T${r}=0,"",IF(${cell}="","",${cell}))`;
+  });
+  return out;
+}
 
-  // v8: consult cases already synced to a role tab get moved to the
-  // Non-Op Consults tab on their next sync (syncCaseToDriveInner sees the
-  // tab differs, deletes the old row and appends to the new tab) — queue
-  // them now so that happens right away. (retagNonOpRows is no longer
-  // needed: consult rows don't live on the role tabs any more.)
-  await setMeta("tabsReady", TABS_SCHEMA_VERSION);
-  for (const c of CASES) {
-    if (caseCategory(c) === NON_OP_CATEGORY && c._sheetSync && c._sheetSync.tab !== TAB_CONSULTS) {
-      await enqueueSync(c.id);
+// Monthly Tally row r (ordinary formulas, no spill): newest month first,
+// back to the oldest month with a Primary/Co-Surgeon or Non-Op case.
+function tallyRowFormulas(r) {
+  const N = FORMULA_ROWS;
+  const [P, C] = [q(TAB_PRIMARY), q(TAB_CONSULTS)];
+  const dates = `${P}!$A$1:$A$${N},${C}!$A$1:$A$${N}`;
+  const a = r === 2
+    ? `=IF(COUNT(${dates})=0,"",EOMONTH(MAX(${dates}),-1)+1)`
+    : `=IF(A${r - 1}="","",IF(EDATE(A${r - 1},-1)<EOMONTH(MIN(${dates}),-1)+1,"",EDATE(A${r - 1},-1)))`;
+  const pa = `${P}!$A$1:$A$${N}`, po = `${P}!$O$1:$O$${N}`, na = `${C}!$A$1:$A$${N}`;
+  const cnt = (cat) => `=IF($A${r}="","",COUNTIFS(${pa},">="&$A${r},${pa},"<"&EDATE($A${r},1),${po},"${cat}"))`;
+  return [a, cnt("Bariatric"), cnt("EGD"), cnt("Back"), cnt("General Surgery"), cnt("Tummy Tuck"),
+    `=IF($A${r}="","",SUM(B${r}:F${r}))`,
+    `=IF($A${r}="","",COUNTIFS(${na},">="&$A${r},${na},"<"&EDATE($A${r},1)))`];
+}
+
+async function ensureWorkbookSchema(itemId) {
+  const ready = await getMeta("wbSchemaReady", null);
+  if (ready && ready.itemId === itemId && ready.version >= WB_SCHEMA_VERSION) return;
+  const sheets = await graphJson(`${wbPath(itemId)}/worksheets?$select=name`);
+  const names = (sheets.value || []).map((s) => s.name);
+  const missing = ALL_TABS.filter((t) => !names.includes(t));
+  const reqs = [];
+  for (const tab of missing) reqs.push({ method: "POST", url: `${wbPath(itemId)}/worksheets/add`, body: { name: tab } });
+  for (const tab of [...DATA_TABS, TAB_ALL]) {
+    if (missing.includes(tab)) reqs.push({ method: "PATCH", url: rangePath(itemId, tab, "A1:O1"), body: { values: [SHEET_HEADER] } });
+  }
+  if (missing.includes(TAB_ALL)) {
+    reqs.push({ method: "PATCH", url: rangePath(itemId, TAB_ALL, "Q1:S1"), body: { formulas: [allCasesCounts()] } });
+    // 5,000 rows of formulas, sent 250 rows per request.
+    for (let r0 = 2; r0 < ALL_CASES_ROWS + 2; r0 += 250) {
+      const rows = [];
+      for (let r = r0; r < Math.min(r0 + 250, ALL_CASES_ROWS + 2); r++) rows.push(allCasesRowFormulas(r));
+      reqs.push({ method: "PATCH", url: rangePath(itemId, TAB_ALL, `A${r0}:W${r0 + rows.length - 1}`), body: { formulas: rows } });
+    }
+    reqs.push({ method: "PATCH", url: rangePath(itemId, TAB_ALL, "P:W"), body: { columnHidden: true } });
+  }
+  if (missing.includes(TAB_TALLY)) {
+    reqs.push({
+      method: "PATCH",
+      url: rangePath(itemId, TAB_TALLY, "A1:H1"),
+      body: { values: [["Month", "Bariatric", "EGD", "Back", "General Surgery", "Tummy Tuck", "Total", "Non-Op Consults"]] },
+    });
+    const rows = [];
+    for (let r = 2; r < TALLY_ROWS + 2; r++) rows.push(tallyRowFormulas(r));
+    reqs.push({ method: "PATCH", url: rangePath(itemId, TAB_TALLY, `A2:H${TALLY_ROWS + 1}`), body: { formulas: rows } });
+    reqs.push({ method: "PATCH", url: rangePath(itemId, TAB_TALLY, `A2:A${TALLY_ROWS + 1}`), body: { numberFormat: Array.from({ length: TALLY_ROWS }, () => ["mmm yyyy"]) } });
+  }
+  for (let i = 0; i < reqs.length; i += 20) await graphBatch(reqs.slice(i, i + 20));
+  await setMeta("wbSchemaReady", { itemId, version: WB_SCHEMA_VERSION });
+}
+
+async function ensureWorkbook() {
+  const itemId = await findOrCreateWorkbook();
+  try {
+    await ensureWorkbookSchema(itemId);
+  } catch (err) {
+    // The stored item may have been deleted/replaced in OneDrive — look
+    // it up again by path once before giving up.
+    if (err.status === 404 || /itemNotFound/i.test(err.message)) {
+      await setMeta("workbookItemId", null);
+      await setMeta("wbSchemaReady", null);
+      const again = await findOrCreateWorkbook();
+      await ensureWorkbookSchema(again);
+      return again;
+    }
+    throw err;
+  }
+  return itemId;
+}
+
+// ---- Cell values ----------------------------------------------------
+
+// Excel date serial (days since 1899-12-30) from "YYYY-MM-DD".
+function excelSerialFromISO(iso) {
+  const m = String(iso || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  return Date.UTC(+m[1], +m[2] - 1, +m[3]) / 86400000 + 25569;
+}
+function excelSerialFromTimestamp(ms) {
+  if (!ms) return null;
+  const local = ms - new Date(ms).getTimezoneOffset() * 60000;
+  return Math.round((local / 86400000 + 25569) * 100000) / 100000;
+}
+
+// Column number formats: A Date, D DOB, I Billed Date are real Excel
+// dates; everything else is text ("@") so MRNs keep leading zeros and
+// codes like "99222-57" are never reinterpreted.
+const ROW_NUMBER_FORMAT = SHEET_HEADER.map((_, i) => (i === 0 || i === 3 ? "m/d/yyyy" : i === 8 ? "m/d/yyyy h:mm AM/PM" : "@"));
+
+function caseToExcelRow(c) {
+  const row = caseToRow(c).map((v) => (v == null ? "" : String(v)));
+  const dos = excelSerialFromISO(c.dos);
+  const dob = excelSerialFromISO(c.dob);
+  const billed = c.status === "billed" ? excelSerialFromTimestamp(c.billedAt) : null;
+  row[0] = dos != null ? dos : row[0];
+  row[3] = dob != null ? dob : row[3];
+  row[8] = billed != null ? billed : "";
+  return row;
+}
+
+// ---- Reading the data tabs ------------------------------------------
+
+function rowFromAddress(addr) {
+  const m = String(addr || "").match(/![A-Z]+(\d+)/);
+  return m ? Number(m[1]) : 1;
+}
+
+// Returns { [tab]: { rows: [...values], lastRow } } where rows[i] is
+// sheet row i + 2 (row 1 = header).
+async function readDataTabs(itemId) {
+  const bodies = await graphBatch(
+    DATA_TABS.map((tab) => ({ method: "GET", url: `${wsPath(itemId, tab)}/usedRange(valuesOnly=true)?$select=address,values` }))
+  ).catch(async () => {
+    // $batch requests don't depend on each other here; fall back to one
+    // at a time if the batch itself failed for an unrelated reason.
+    const out = [];
+    for (const tab of DATA_TABS) out.push(await graphJson(`${wsPath(itemId, tab)}/usedRange(valuesOnly=true)?$select=address,values`));
+    return out;
+  });
+  const out = {};
+  DATA_TABS.forEach((tab, i) => {
+    const body = bodies[i] || {};
+    const start = rowFromAddress(body.address);
+    const values = body.values || [];
+    const rows = [];
+    values.forEach((r, j) => {
+      const rowNum = start + j;
+      if (rowNum >= 2) rows[rowNum - 2] = r;
+    });
+    for (let k = 0; k < rows.length; k++) if (!rows[k]) rows[k] = [];
+    out[tab] = { rows, lastRow: Math.max(1, start + values.length - 1) };
+  });
+  return out;
+}
+
+function sheetDateToISO(v) {
+  if (v == null || v === "") return "";
+  if (typeof v === "number" || /^\d{5}(\.\d+)?$/.test(String(v).trim())) {
+    const d = new Date(Math.round((Number(v) - 25569) * 86400000));
+    return isNaN(d) ? "" : d.toISOString().slice(0, 10);
+  }
+  const str = String(v).trim();
+  let m = str.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
+  m = str.match(/^(\d{1,2})[\/.](\d{1,2})[\/.](\d{2,4})/);
+  if (m) {
+    const y = m[3].length === 2 ? "20" + m[3] : m[3];
+    return `${y}-${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}`;
+  }
+  return str;
+}
+const normName = (n) => String(n || "").toLowerCase().replace(/[^a-z]/g, "");
+const normMrn = (n) => String(n || "").replace(/\D/g, "").replace(/^0+/, "");
+const normCpt = (s) => String(s || "").replace(/\s/g, "");
+
+function caseMatchesRow(c, row) {
+  if (!row || !row.length) return false;
+  if (sheetDateToISO(row[0]) !== c.dos) return false;
+  const cm = normMrn(c.mrn), rm = normMrn(row[2]);
+  if (cm && rm) return cm === rm;
+  const cn = normName(c.patientName), rn = normName(row[1]);
+  if (cn && rn) return cn === rn;
+  return normCpt(row[9]) === c.cptCodes.map((x) => x.code).join(";");
+}
+
+// Finds the row holding case c. Several rows can share a date + MRN (two
+// operations on one patient the same day), so among the candidates
+// prefer: same CPT list, then the row the case was last written to, then
+// the tab the case belongs on. `claimed` (a Set of "tab|row") keeps two
+// phone cases from both mapping to the same row.
+function findCaseInTabs(c, tabs, claimed) {
+  const target = tabForCase(c);
+  const cpt = c.cptCodes.map((x) => x.code).join(";");
+  let best = null, bestScore = -1;
+  for (const t of DATA_TABS) {
+    const rows = (tabs[t] && tabs[t].rows) || [];
+    for (let i = 0; i < rows.length; i++) {
+      if (!caseMatchesRow(c, rows[i])) continue;
+      const key = `${t}|${i + 2}`;
+      if (claimed && claimed.has(key)) continue;
+      let score = 0;
+      if (normCpt(rows[i][9]) === cpt) score += 4;
+      if (c._sheetSync && c._sheetSync.tab === t && c._sheetSync.row === i + 2) score += 2;
+      if (t === target) score += 1;
+      if (score > bestScore) { best = { tab: t, row: i + 2 }; bestScore = score; }
     }
   }
+  return best;
 }
 
-// One-time fix-up for the v6 "Non-Op Consult" category: cases already
-// synced before v6 had their Category cell (column O) written as
-// "General Surgery". For each such case we know the row of (via
-// _sheetSync), re-read that row first and only rewrite column O if the
-// row's MRN + patient name still match the case — so a row that's been
-// moved/sorted by hand is left alone rather than overwritten blindly.
-async function retagNonOpRows(sheetId) {
-  const targets = CASES.filter(
-    (c) => c._sheetSync && c._sheetSync.tab && c._sheetSync.row && caseCategory(c) === NON_OP_CATEGORY
-  );
-  if (!targets.length) return;
-  const ranges = targets.map((c) => `'${c._sheetSync.tab}'!A${c._sheetSync.row}:O${c._sheetSync.row}`);
-  const qs = ranges.map((r) => "ranges=" + encodeURIComponent(r)).join("&");
-  const res = await driveFetchOk(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values:batchGet?${qs}`);
-  const json = await res.json();
-  const data = [];
-  (json.valueRanges || []).forEach((vr, i) => {
-    const c = targets[i];
-    const row = (vr.values && vr.values[0]) || [];
-    if (String(row[1] || "") !== String(c.patientName || "")) return;
-    if (String(row[2] || "") !== String(c.mrn || "")) return;
-    if (row[14] === NON_OP_CATEGORY) return;
-    data.push({ range: `'${c._sheetSync.tab}'!O${c._sheetSync.row}`, values: [[NON_OP_CATEGORY]] });
+// The weekly biller report marks rows "done". If the workbook says done
+// (or billed) and the phone still says pending, the phone adopts it, so
+// a later re-sync can't flip the row back to "pending".
+async function adoptSheetStatus(c, row) {
+  if (!row || c.status !== "pending") return false;
+  if (!/^(done|billed)$/i.test(String(row[7] || "").trim())) return false;
+  c.status = "billed";
+  c.billedAt = Date.now();
+  await saveCase(c);
+  return true;
+}
+
+// Row a new case should be inserted at so the tab stays newest-first:
+// directly above the first row dated the same day or earlier. If every
+// row is newer, it goes after the last row.
+function insertRowFor(c, tabData) {
+  const serial = excelSerialFromISO(c.dos);
+  const rows = (tabData && tabData.rows) || [];
+  if (serial != null) {
+    for (let i = 0; i < rows.length; i++) {
+      const v = rows[i] && rows[i][0];
+      const n = typeof v === "number" ? v : excelSerialFromISO(sheetDateToISO(v));
+      if (n != null && n <= serial) return { row: i + 2, insert: true };
+    }
+  }
+  return { row: Math.max(2, ((tabData && tabData.lastRow) || 1) + 1), insert: false };
+}
+
+async function insertCaseRow(itemId, tab, c, tabData) {
+  const { row, insert } = insertRowFor(c, tabData);
+  const addr = `A${row}:O${row}`;
+  const url = rangePath(itemId, tab, addr);
+  const reqs = [];
+  if (insert) reqs.push({ method: "POST", url: `${url}/insert`, body: { shift: "Down" } });
+  // A freshly inserted row copies the formatting of the row above it
+  // (the bold header, when it's row 2) — reset it to plain data style.
+  reqs.push({ method: "POST", url: `${url}/format/fill/clear`, body: {} });
+  reqs.push({ method: "PATCH", url: `${url}/format/font`, body: { bold: false, italic: false, color: "#000000" } });
+  reqs.push({ method: "PATCH", url, body: { numberFormat: [ROW_NUMBER_FORMAT] } });
+  reqs.push({ method: "PATCH", url, body: { values: [caseToExcelRow(c)] } });
+  await graphBatch(reqs);
+  return { tab, row };
+}
+
+async function updateCaseRow(itemId, tab, rowNum, c) {
+  await graphFetch(rangePath(itemId, tab, `A${rowNum}:O${rowNum}`), {
+    method: "PATCH",
+    body: JSON.stringify({ values: [caseToExcelRow(c)] }),
   });
-  if (!data.length) return;
-  await driveFetchOk(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values:batchUpdate`, {
+}
+
+async function deleteCaseRow(itemId, tab, rowNum) {
+  await graphFetch(`${rangePath(itemId, tab, `A${rowNum}:O${rowNum}`)}/delete`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ valueInputOption: "USER_ENTERED", data }),
+    body: JSON.stringify({ shift: "Up" }),
   });
 }
 
-async function ensureSpreadsheet() {
-  const sheetId = await findOrCreateSheet();
-  await ensureTabs(sheetId);
-  return sheetId;
-}
-
-// Extracts the 1-based row number Sheets actually wrote to from an
-// append response's updatedRange, e.g. "'Assistant'!A5:P5" -> 5.
-function rowFromUpdatedRange(range) {
-  if (!range) return null;
-  const m = range.match(/![A-Z]+(\d+):/);
-  return m ? Number(m[1]) : null;
-}
-
-// v1.12: a case is put in the persisted queue BEFORE any network work
-// and only taken out once the sheet write succeeds. Previously it was
-// queued only after a failure was detected — so if the sync hung (see
-// error_callback in initGoogleAuth) or iOS suspended the app mid-sync
-// right after Save, the case was never queued and never retried.
+// ---- Sync queue -----------------------------------------------------
+// A case is queued BEFORE any network work and only removed once the
+// workbook write succeeds, so a failed or interrupted sync is retried.
 const syncInFlight = new Set();
 async function enqueueSync(id) {
   if (!SYNC_QUEUE.includes(id)) SYNC_QUEUE.push(id);
@@ -2495,68 +2570,43 @@ async function dequeueSync(id) {
 
 async function syncCaseToDrive(c, { quiet = false } = {}) {
   await enqueueSync(c.id);
-  if (syncInFlight.has(c.id)) return; // already being written; it stays queued either way
+  if (syncInFlight.has(c.id)) return;
   syncInFlight.add(c.id);
   try {
-    await syncCaseToDriveInner(c, { quiet });
+    await syncCaseInner(c, { quiet });
   } finally {
     syncInFlight.delete(c.id);
   }
 }
 
-async function syncCaseToDriveInner(c, { quiet }) {
-  // Tries a silent reauth first (see ensureFreshToken) so a case synced
-  // shortly after the token expired still goes straight through instead
-  // of waiting on a manual reconnect.
-  const ready = await ensureFreshToken();
-  if (!ready) {
-    render(); // surface the reconnect banner right away, not just on next nav
+async function syncCaseInner(c, { quiet }) {
+  if (!(await ensureFreshToken())) {
+    render(); // reconnect banner
     return;
   }
   try {
-    const sheetId = await ensureSpreadsheet();
+    const itemId = await ensureWorkbook();
     const tab = tabForCase(c);
-    let row = caseToRow(c);
+    const tabs = await readDataTabs(itemId);
+    const found = findCaseInTabs(c, tabs);
+    if (found) await adoptSheetStatus(c, tabs[found.tab].rows[found.row - 2]);
 
-    // v1.12: before overwriting a row in place, make sure it is still
-    // THIS case (rows can shift if the sheet is sorted or a row deleted
-    // by hand). If it isn't, look the case up; if it can't be found,
-    // fall through and append it fresh rather than clobbering someone
-    // else's row.
-    if (c._sheetSync && c._sheetSync.tab && c._sheetSync.row) {
-      const verified = await verifyOrLocateRow(sheetId, c);
-      c._sheetSync = verified;
-      if (!verified) await saveCase(c);
-      row = caseToRow(c); // status may have been adopted from the sheet
-    }
-
-    if (c._sheetSync && c._sheetSync.tab === tab && c._sheetSync.row) {
-      // Already has a row on the right tab (from an earlier save, or a
-      // billed-status change) — update it in place rather than
-      // appending a duplicate.
-      await driveFetchOk(
-        `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/'${tab}'!A${c._sheetSync.row}:O${c._sheetSync.row}?valueInputOption=USER_ENTERED`,
-        {
-          method: "PUT",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ values: [row] }),
-        }
-      );
+    if (found && found.tab === tab) {
+      await updateCaseRow(itemId, tab, found.row, c);
+      c._sheetSync = found;
     } else {
-      if (c._sheetSync && c._sheetSync.tab && c._sheetSync.row) {
-        // The case now belongs on a different tab (role changed, or it
-        // became / stopped being consult-only). Its old row was just
-        // verified to be this case (verifyOrLocateRow above), so delete
-        // that row outright — v1.13: deleting rather than clearing, so no
-        // empty gap is left inside a formatted table.
-        await deleteSheetRow(sheetId, c._sheetSync.tab, c._sheetSync.row);
-        c._sheetSync = null;
+      if (found) {
+        // The case now belongs on another tab (role changed, or it became
+        // / stopped being consult-only): remove its old row first.
+        await deleteCaseRow(itemId, found.tab, found.row);
       }
-      c._sheetSync = await appendCaseRow(sheetId, tab, c, row);
-      await saveCase(c); // persist the row pointer so later edits update instead of re-appending
+      // Re-read the target tab if a delete just shifted rows on it.
+      const fresh = found && found.tab === tab ? await readDataTabs(itemId) : tabs;
+      c._sheetSync = await insertCaseRow(itemId, tab, c, fresh[tab]);
     }
+    await saveCase(c);
     await dequeueSync(c.id);
-    if (!quiet) toast("Synced to Google Sheets");
+    if (!quiet) toast("Saved to Excel (OneDrive)");
     render();
   } catch (err) {
     console.error(err);
@@ -2564,215 +2614,35 @@ async function syncCaseToDriveInner(c, { quiet }) {
   }
 }
 
-// ---------------------------------------------------------------------
-// Tables-aware writes (v1.13)
-// ---------------------------------------------------------------------
-// The data tabs may be formatted as Google Sheets "Tables" (Format →
-// Convert to table). values.append (what the app used before) writes
-// BELOW a table, not into it. The Sheets API's AppendCellsRequest with a
-// tableId appends into the table body instead ("appends the values to
-// the first free row … inserts rows to the end of the table and before
-// any footer"). So: look up each tab's numeric sheetId and table (if
-// any), and append through the table when there is one; fall back to
-// values.append on a plain tab.
-let sheetMetaCache = null;
-async function getSheetMeta(sheetId, { refresh = false } = {}) {
-  if (sheetMetaCache && sheetMetaCache.id === sheetId && !refresh) return sheetMetaCache.tabs;
-  const res = await driveFetchOk(
-    `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=${encodeURIComponent("sheets(properties(sheetId,title),tables(tableId,name,range))")}`
-  );
-  const json = await res.json();
-  const tabs = {};
-  for (const s of json.sheets || []) {
-    const title = s.properties.title;
-    // The case table is the one anchored at A1 (header row 1).
-    const table = (s.tables || []).find((t) => {
-      const r = t.range || {};
-      return (r.startRowIndex || 0) === 0 && (r.startColumnIndex || 0) === 0;
-    });
-    tabs[title] = { gridId: s.properties.sheetId, tableId: table ? table.tableId : null };
-  }
-  sheetMetaCache = { id: sheetId, tabs };
-  return tabs;
-}
-
-// Date serial for Sheets (days since 1899-12-30) from "MM/DD/YYYY".
-function sheetSerialFromMDY(str) {
-  const m = String(str || "").match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  if (!m) return null;
-  return Date.UTC(+m[3], +m[1] - 1, +m[2]) / 86400000 + 25569;
-}
-
-// One row (caseToRow output) as AppendCellsRequest CellData, typed the
-// way USER_ENTERED would have typed it: Date (A) and DOB (D) as real
-// dates, plain whole numbers (MRN, modifier) as numbers unless they have
-// a leading zero, everything else as text.
-function rowToCellData(row) {
-  return row.map((v, i) => {
-    const str = v == null ? "" : String(v);
-    if (str === "") return {};
-    if (i === 0 || i === 3) {
-      const serial = sheetSerialFromMDY(str);
-      if (serial != null) return { userEnteredValue: { numberValue: serial } };
-    }
-    if (/^[1-9]\d{0,14}$/.test(str)) return { userEnteredValue: { numberValue: Number(str) } };
-    return { userEnteredValue: { stringValue: str } };
-  });
-}
-
-async function appendCaseRow(sheetId, tab, c, row) {
-  let meta = await getSheetMeta(sheetId);
-  if (!meta[tab]) meta = await getSheetMeta(sheetId, { refresh: true });
-  const info = meta[tab];
-  if (info && info.tableId) {
-    await driveFetchOk(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        requests: [{
-          appendCells: {
-            tableId: info.tableId,
-            rows: [{ values: rowToCellData(row) }],
-            fields: "userEnteredValue",
-          },
-        }],
-      }),
-    });
-    // appendCells doesn't report the row it wrote — look it up.
-    return findCaseInTabs(c, await readDataTabs(sheetId));
-  }
-  const appendRes = await driveFetchOk(
-    `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/'${tab}'!A1:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ values: [row] }),
-    }
-  );
-  const appendJson = await appendRes.json();
-  return { tab, row: rowFromUpdatedRange(appendJson.updates && appendJson.updates.updatedRange) };
-}
-
-async function deleteSheetRow(sheetId, tab, rowNum) {
-  let meta = await getSheetMeta(sheetId);
-  if (!meta[tab]) meta = await getSheetMeta(sheetId, { refresh: true });
-  const info = meta[tab];
-  if (!info) return;
-  await driveFetchOk(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      requests: [{
-        deleteDimension: { range: { sheetId: info.gridId, dimension: "ROWS", startIndex: rowNum - 1, endIndex: rowNum } },
-      }],
-    }),
-  });
-}
-
-// ---------------------------------------------------------------------
-// Sheet reconciliation (v1.12)
-// ---------------------------------------------------------------------
-// The phone is the source of truth: every case lives in IndexedDB
-// whether or not it reached the sheet. reconcileWithSheet() reads both
-// data tabs, matches each phone case to a row (same date of service AND
-// same MRN, or same name when MRN is blank), and lists every case that
-// has no matching row. Runs automatically on launch and from Settings →
-// "Check for missing cases"; the user reviews the list and taps "Add to
-// sheet" — nothing is appended without that tap.
-
-function sheetDateToISO(v) {
-  if (v == null) return "";
-  const str = String(v).trim();
-  let m = str.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
-  if (m) return `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}`;
-  m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
-  if (m) {
-    const y = m[3].length === 2 ? "20" + m[3] : m[3];
-    return `${y}-${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}`;
-  }
-  return str;
-}
-const normName = (n) => String(n || "").toLowerCase().replace(/[^a-z]/g, "");
-const normMrn = (n) => String(n || "").replace(/\D/g, "").replace(/^0+/, "");
-
-function caseMatchesRow(c, row) {
-  if (!row || !row.length) return false;
-  if (sheetDateToISO(row[0]) !== c.dos) return false;
-  const cm = normMrn(c.mrn), rm = normMrn(row[2]);
-  if (cm && rm) return cm === rm;
-  const cn = normName(c.patientName), rn = normName(row[1]);
-  if (cn && rn) return cn === rn;
-  // No usable identifier on one side — fall back to the CPT list.
-  return String(row[9] || "").replace(/\s/g, "") === c.cptCodes.map((x) => x.code).join(";");
-}
-
-async function readDataTabs(sheetId) {
-  const qs = DATA_TABS.map((t) => "ranges=" + encodeURIComponent(`'${t}'!A2:O5000`)).join("&");
-  const res = await driveFetchOk(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values:batchGet?${qs}`);
-  const json = await res.json();
-  const out = {};
-  DATA_TABS.forEach((t, i) => { out[t] = ((json.valueRanges || [])[i] || {}).values || []; });
-  return out;
-}
-
-function findCaseInTabs(c, tabs) {
-  // Prefer the tab the case's role belongs on, then the other one.
-  const order = [tabForCase(c), ...DATA_TABS.filter((t) => t !== tabForCase(c))];
-  for (const t of order) {
-    const rows = tabs[t] || [];
-    for (let i = 0; i < rows.length; i++) {
-      if (caseMatchesRow(c, rows[i])) return { tab: t, row: i + 2 };
-    }
-  }
-  return null;
-}
-
-// v1.13: the weekly biller-email script (Apps Script in the sheet) marks
-// rows "done". If the sheet says done/billed and the phone still says
-// pending, the phone adopts it — so the phone's Pending list clears and
-// a later re-sync of the case can't flip the sheet back to "pending".
-async function adoptSheetStatus(c, row) {
-  if (!row || c.status !== "pending") return false;
-  if (!/^(done|billed)$/i.test(String(row[7] || "").trim())) return false;
-  c.status = "billed";
-  c.billedAt = Date.now();
-  await saveCase(c);
-  return true;
-}
-
-async function verifyOrLocateRow(sheetId, c) {
-  const { tab, row } = c._sheetSync;
-  const res = await driveFetchOk(
-    `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(`'${tab}'!A${row}:O${row}`)}`
-  );
-  const json = await res.json();
-  if (caseMatchesRow(c, (json.values || [])[0])) {
-    await adoptSheetStatus(c, (json.values || [])[0]);
-    return { tab, row };
-  }
-  const tabs = await readDataTabs(sheetId);
-  const found = findCaseInTabs(c, tabs);
-  if (found) await adoptSheetStatus(c, tabs[found.tab][found.row - 2]);
-  return found;
-}
-
+// ---- Reconciliation -------------------------------------------------
+// The phone is the source of truth for the cases it has. Compare every
+// phone case with the workbook and list the ones with no matching row;
+// nothing is added without the user's tap ("Add N to sheet").
 async function reconcileWithSheet({ manual = false } = {}) {
   if (!(await ensureFreshToken())) {
-    if (manual) toast("Connect Google Drive first", true);
+    if (manual) toast("Connect Microsoft 365 first", true);
     render();
     return;
   }
   state.reconcileBusy = true;
   if (manual) render();
   try {
-    const sheetId = await ensureSpreadsheet();
-    const tabs = await readDataTabs(sheetId);
+    const itemId = await ensureWorkbook();
+    const tabs = await readDataTabs(itemId);
+    const claimed = new Set();
     const missing = [];
-    for (const c of CASES) {
-      const found = findCaseInTabs(c, tabs);
+    // Exact-CPT matches first so they claim their rows before looser ones.
+    const ordered = [...CASES].sort((a, b) => {
+      const fa = findCaseInTabs(a, tabs), fb = findCaseInTabs(b, tabs);
+      const sa = fa && normCpt(tabs[fa.tab].rows[fa.row - 2][9]) === a.cptCodes.map((x) => x.code).join(";") ? 0 : 1;
+      const sb = fb && normCpt(tabs[fb.tab].rows[fb.row - 2][9]) === b.cptCodes.map((x) => x.code).join(";") ? 0 : 1;
+      return sa - sb;
+    });
+    for (const c of ordered) {
+      const found = findCaseInTabs(c, tabs, claimed);
       if (found) {
-        await adoptSheetStatus(c, tabs[found.tab][found.row - 2]);
-        // Also repair a stale row pointer while we're here.
+        claimed.add(`${found.tab}|${found.row}`);
+        await adoptSheetStatus(c, tabs[found.tab].rows[found.row - 2]);
         if (!c._sheetSync || c._sheetSync.tab !== found.tab || c._sheetSync.row !== found.row) {
           c._sheetSync = found;
           await saveCase(c);
@@ -2783,15 +2653,15 @@ async function reconcileWithSheet({ manual = false } = {}) {
     }
     missing.sort((a, b) => {
       const ca = CASES.find((x) => x.id === a), cb = CASES.find((x) => x.id === b);
-      return String(ca.dos).localeCompare(String(cb.dos));
+      return String(cb.dos).localeCompare(String(ca.dos));
     });
     state.missingIds = missing;
     state.missingSelected = new Set(missing);
     state.reconcileCheckedAt = Date.now();
-    if (manual) toast(missing.length ? `${missing.length} case(s) on this phone are not on the sheet` : "Everything on this phone is on the sheet ✓", !!missing.length);
+    if (manual) toast(missing.length ? `${missing.length} case(s) on this phone are not in the workbook` : "Everything on this phone is in the workbook ✓", !!missing.length);
   } catch (err) {
     console.error(err);
-    if (manual) toast("Couldn't read the sheet — try again", true);
+    if (manual) toast("Couldn't read the workbook — try again", true);
   } finally {
     state.reconcileBusy = false;
     render();
@@ -2806,12 +2676,176 @@ async function addMissingToSheet() {
   for (const id of ids) {
     const c = CASES.find((x) => x.id === id);
     if (!c) continue;
-    c._sheetSync = null; // force a fresh append
+    c._sheetSync = null;
     await saveCase(c);
     await syncCaseToDrive(c, { quiet: true });
   }
   state.reconcileBusy = false;
   await reconcileWithSheet({ manual: true });
+}
+
+
+// ---- Code library backup (v2.1) --------------------------------------
+// The library lives on the phone (IndexedDB) AND on the "Code Library"
+// tab of ChargeCap Log.xlsx. Phone edits are logged as operations
+// (queueCodeOp) and replayed onto the tab's current contents, so codes
+// typed into the tab in Excel are kept too. After each sync the phone's
+// library is replaced by the tab, which is the master copy.
+const TAB_CODES = "Code Library";
+const CODES_HEADER = ["Type", "Code", "Description", "Category"];
+const TYPE_LABEL = { cpt: "CPT", icd10: "ICD-10" };
+
+function typeFromLabel(v) {
+  const t = String(v || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (t === "CPT") return "cpt";
+  if (t.startsWith("ICD")) return "icd10";
+  return null;
+}
+function cellText(v) {
+  if (v == null) return "";
+  if (typeof v === "number") return String(Number.isInteger(v) ? v : v);
+  return String(v).trim();
+}
+const codeKey = (code) => String(code || "").toUpperCase().replace(/\s+/g, "");
+const sameEntry = (e, code, category) =>
+  codeKey(e.code) === codeKey(code) && (category == null || String(e.category || "").toLowerCase() === String(category || "").toLowerCase());
+
+function applyCodeOps(lists, ops) {
+  for (const o of ops) {
+    const list = lists[o.type];
+    if (!list) continue;
+    if (o.op === "add") {
+      if (!list.some((e) => sameEntry(e, o.code, o.category))) list.unshift({ code: o.code, desc: o.desc, category: o.category });
+    } else if (o.op === "update") {
+      let i = list.findIndex((e) => sameEntry(e, o.from.code, o.from.category));
+      if (i < 0) i = list.findIndex((e) => sameEntry(e, o.from.code, null));
+      const next = { code: o.code, desc: o.desc, category: o.category };
+      if (i >= 0) list[i] = next;
+      else if (!list.some((e) => sameEntry(e, o.code, o.category))) list.unshift(next);
+    } else if (o.op === "delete") {
+      let i = list.findIndex((e) => sameEntry(e, o.code, o.category));
+      if (i < 0) i = list.findIndex((e) => sameEntry(e, o.code, null) && e.desc === o.desc);
+      if (i >= 0) list.splice(i, 1);
+    }
+  }
+  return lists;
+}
+
+let codeSyncTimer = null;
+function scheduleCodeLibrarySync() {
+  refreshCodeLibState();
+  clearTimeout(codeSyncTimer);
+  codeSyncTimer = setTimeout(() => { if (state._m365Account) syncCodeLibrary({ manual: false }); }, 2000);
+}
+async function refreshCodeLibState() {
+  state.codeLibPending = ((await getMeta("codeOps", [])) || []).length;
+  state.codeLibSyncedAt = await getMeta("codeLibSyncedAt", null);
+}
+
+let codeSyncing = false;
+async function syncCodeLibrary({ manual = false } = {}) {
+  if (codeSyncing) return;
+  codeSyncing = true;
+  state.codeLibBusy = true;
+  if (manual) render();
+  try {
+    if (!(await ensureFreshToken())) { if (manual) toast("Connect Microsoft 365 first", true); return; }
+    const itemId = await ensureWorkbook();
+    const ops = (await getMeta("codeOps", [])) || [];
+    const opCount = ops.length;
+    const sheets = await graphJson(`${wbPath(itemId)}/worksheets?$select=name`);
+    const hasTab = (sheets.value || []).some((s) => s.name === TAB_CODES);
+
+    let remote = null; // { cpt: [...], icd10: [...] }
+    let oldLastRow = 1;
+    if (hasTab) {
+      const body = await graphJson(`${wsPath(itemId, TAB_CODES)}/usedRange(valuesOnly=true)?$select=address,values`);
+      const start = rowFromAddress(body.address);
+      const values = body.values || [];
+      oldLastRow = Math.max(1, start + values.length - 1);
+      remote = { cpt: [], icd10: [] };
+      values.forEach((r, j) => {
+        if (start + j < 2) return; // header
+        const type = typeFromLabel(r[0]);
+        const code = cellText(r[1]);
+        if (!type || !code) return;
+        remote[type].push({ code, desc: cellText(r[2]) || code, category: cellText(r[3]) || "Custom" });
+      });
+      if (!remote.cpt.length && !remote.icd10.length) remote = null;
+    }
+
+    let result;
+    let mustWrite = opCount > 0;
+    if (!remote) {
+      // No tab (or an empty one): this phone's library becomes the master.
+      result = { cpt: CPT_LIB.map(({ code, desc, category }) => ({ code, desc, category })), icd10: ICD10_LIB.map(({ code, desc, category }) => ({ code, desc, category })) };
+      mustWrite = true;
+    } else {
+      result = applyCodeOps(remote, ops);
+      // First sync from this phone: keep any codes that exist only here
+      // (added before v2.1), instead of letting the tab overwrite them.
+      if (!(await getMeta("codeLibLinked", false))) {
+        for (const type of ["cpt", "icd10"]) {
+          for (const e of codeLib(type)) {
+            if (!result[type].some((r) => sameEntry(r, e.code, null))) {
+              result[type].unshift({ code: e.code, desc: e.desc, category: e.category });
+              mustWrite = true;
+            }
+          }
+        }
+      }
+    }
+
+    if (mustWrite) {
+      const rows = [
+        ...result.cpt.map((e) => ["CPT", e.code, e.desc, e.category]),
+        ...result.icd10.map((e) => ["ICD-10", e.code, e.desc, e.category]),
+      ];
+      const reqs = [];
+      if (!hasTab) reqs.push({ method: "POST", url: `${wbPath(itemId)}/worksheets/add`, body: { name: TAB_CODES } });
+      const lastNeeded = Math.max(oldLastRow, rows.length + 1);
+      if (hasTab && oldLastRow >= 2) reqs.push({ method: "POST", url: `${rangePath(itemId, TAB_CODES, `A2:D${lastNeeded}`)}/clear`, body: { applyTo: "Contents" } });
+      reqs.push({ method: "PATCH", url: rangePath(itemId, TAB_CODES, "A1:D1"), body: { values: [CODES_HEADER] } });
+      for (let i = 0; i < rows.length; i += 200) {
+        const chunk = rows.slice(i, i + 200);
+        const r0 = i + 2;
+        reqs.push({
+          method: "PATCH",
+          url: rangePath(itemId, TAB_CODES, `A${r0}:D${r0 + chunk.length - 1}`),
+          body: { numberFormat: chunk.map(() => ["@", "@", "@", "@"]), values: chunk },
+        });
+      }
+      for (let i = 0; i < reqs.length; i += 20) await graphBatch(reqs.slice(i, i + 20));
+    }
+
+    // The tab is now the master: replace the phone's copy, keeping ids
+    // for entries that didn't change so an open edit form isn't broken.
+    for (const type of ["cpt", "icd10"]) {
+      const old = codeLib(type);
+      const next = result[type].map((e) => {
+        const prev = old.find((o) => sameEntry(o, e.code, e.category) && o.desc === e.desc);
+        return { ...e, id: prev ? prev.id : uuid() };
+      });
+      if (type === "cpt") CPT_LIB = next; else ICD10_LIB = next;
+      await persistCodeLib(type);
+    }
+    // Drop only the operations this sync replayed; edits made while it
+    // was running stay queued for the next one.
+    const now = (await getMeta("codeOps", [])) || [];
+    await setMeta("codeOps", now.slice(opCount));
+    await setMeta("codeLibLinked", true);
+    await setMeta("codeLibSyncedAt", Date.now());
+    await refreshCodeLibState();
+    if (manual) toast("Code library synced");
+    if (state.codeLibPending) scheduleCodeLibrarySync();
+  } catch (err) {
+    console.error("Code library sync failed", err);
+    if (manual) toast("Code library sync failed — your changes are saved on this phone and will retry", true);
+  } finally {
+    codeSyncing = false;
+    state.codeLibBusy = false;
+    render();
+  }
 }
 
 let flushing = false;
@@ -2824,11 +2858,11 @@ async function flushSyncQueue() {
     let ok = 0;
     for (const id of queue) {
       const c = CASES.find((x) => x.id === id);
-      if (!c) { await dequeueSync(id); continue; } // case deleted on the phone
+      if (!c) { await dequeueSync(id); continue; }
       await syncCaseToDrive(c, { quiet: true });
       if (!SYNC_QUEUE.includes(id)) ok++;
     }
-    if (ok) toast(`Synced ${ok} queued case(s) to Google Sheets`);
+    if (ok) toast(`Saved ${ok} queued case(s) to Excel`);
     if (SYNC_QUEUE.length) toast(`${SYNC_QUEUE.length} case(s) still waiting to sync`, true);
   } finally {
     flushing = false;
@@ -2836,54 +2870,55 @@ async function flushSyncQueue() {
   }
 }
 
-window.addEventListener("online", flushSyncQueue);
-// iOS rarely fires "online" for a home-screen app; coming back to the
-// foreground is the realistic moment to retry anything still queued.
+window.addEventListener("online", () => { flushSyncQueue(); if (state.codeLibPending) syncCodeLibrary(); });
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible") flushSyncQueue();
+  if (document.visibilityState === "visible") {
+    flushSyncQueue();
+    if (state.codeLibPending) syncCodeLibrary();
+  }
 });
 
 // ---------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------
 
+// One-time switch from the Google Sheet (v1.x) to the OneDrive workbook:
+// old row pointers refer to the Google sheet, so drop them (the first
+// reconcile re-links every case to its row in the workbook) and forget
+// the Google token/sheet id. Cases themselves are untouched.
+async function migrateToM365() {
+  if ((await getMeta("syncBackend", null)) === "m365") return;
+  for (const c of CASES) {
+    if (c._sheetSync) {
+      delete c._sheetSync;
+      await saveCase(c);
+    }
+  }
+  for (const k of ["driveToken", "driveTokenExpiry", "sheetId", "tabsReady", "googleClientId"]) await setMeta(k, null);
+  await setMeta("syncBackend", "m365");
+}
+
 async function boot() {
   await loadCases();
   await loadCodes();
   state.lastFacility = await getMeta("lastFacility", null);
-  state._clientId = (await getMeta("googleClientId", DEFAULT_GOOGLE_CLIENT_ID)) || DEFAULT_GOOGLE_CLIENT_ID;
   SYNC_QUEUE = (await getMeta("syncQueue", [])) || [];
-  await restoreDriveToken(); // reuse a still-valid token instead of forcing reconnect on every launch
+  await migrateToM365();
   render();
 
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("sw.js").catch((err) => console.error("SW registration failed", err));
   }
 
-  if (state._clientId) {
-    // Google's GSI script loads async over the network and usually
-    // isn't ready this early — wait for it before touching tokenClient,
-    // otherwise this whole attempt just silently no-ops (see
-    // waitForGoogleIdentity) and it's back to needing a manual tap for
-    // no real reason.
-    if (await waitForGoogleIdentity()) {
-      initGoogleAuth();
-      // If the restored token was missing/expired, try a silent (no-UI)
-      // reauth — on a device that's stayed signed into Google this
-      // often succeeds with no tap at all. flushSyncQueue() covers the
-      // case where a valid token was already restored; if the silent
-      // attempt fails too, the reconnect banner (see render()) is the
-      // fallback.
-      if (!state._driveToken) await ensureFreshToken();
-      if (state._driveToken) {
-        await flushSyncQueue();
-        // v1.12: compare what's on this phone with what's on the sheet
-        // and surface anything missing (see reconcileWithSheet).
-        reconcileWithSheet({ manual: false });
-      } else {
-        render();
-      }
-    }
+  // Processes the sign-in redirect if we just came back from Microsoft.
+  await initMsal();
+  await refreshCodeLibState();
+  if (state._m365Account && (await ensureFreshToken())) {
+    await flushSyncQueue();
+    await syncCodeLibrary({ manual: false });
+    reconcileWithSheet({ manual: false });
+  } else {
+    render();
   }
 }
 

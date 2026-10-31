@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>ChargeCap</title>
 <meta name="theme-color" content="#0f4c5c" />
-<meta name="description" content="Surgical charge capture — CPT/ICD-10 coding, OCR sticker scan, billing status, Google Drive sync." />
+<meta name="description" content="Surgical charge capture — CPT/ICD-10 coding, OCR sticker scan, billing status, Microsoft 365 (OneDrive Excel) sync." />
 <link rel="manifest" href="manifest.json" />
 <link rel="apple-touch-icon" href="icons/icon-192.png" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
@@ -21,8 +21,8 @@
 <script src="https://unpkg.com/idb-keyval@6/dist/umd.js"></script>
 <!-- Tesseract.js: on-device OCR, no server required -->
 <script src="https://unpkg.com/tesseract.js@5/dist/tesseract.min.js"></script>
-<!-- Google Identity Services: OAuth token client for Drive/Sheets sync (optional — app works without it) -->
-<script src="https://accounts.google.com/gsi/client" async defer></script>
+<!-- MSAL.js 3.30.0 (Microsoft sign-in), bundled with the app so it is cached for offline use -->
+<script src="msal-browser.min.js"></script>
 
 <script src="data.js"></script>
 <script src="app.js"></script>

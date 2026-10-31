@@ -1,231 +1,150 @@
-# ChargeCap v1.13
+# ChargeCap v2.1: Microsoft 365 + code library backup
 
-## v1.13 (2026-10-16) — deploy this instead of v1.12
-- **Writes into Google Sheets Tables.** If a data tab has been converted to
-  a table (Format → Convert to table), new cases are added with the Sheets
-  API's AppendCellsRequest + tableId, so they land INSIDE the table (first
-  free row, else a new row at the end of the table). Dates go in as real
-  dates. Tabs without a table still use values.append.
-- **Non-Op Consults is a real data tab.** Consult-only cases are saved only
-  there (any role), never on Primary/Assistant. All Cases stacks all three
-  tabs (blank rows filtered out); Monthly Tally months and column H read
-  the consult tab. TABS_SCHEMA_VERSION 8. Consult cases already on a role
-  tab are moved on the next sync (old row deleted, not just cleared).
-- A case moving tabs (role edit / becomes a consult) deletes its old row
-  instead of leaving a blank one.
-- sw.js CACHE_VERSION chargecap-v24.
+## New in v2.1 (2026-10-31)
+- **Code library backup.** The CPT/ICD-10 library is now also stored on a
+  **Code Library** tab in `ChargeCap Log.xlsx` (columns Type, Code,
+  Description, Category). Every add/edit/delete on the phone is logged and
+  replayed onto that tab about 2 seconds later (or on the next launch if
+  offline). After each sync the phone reloads its library from the tab, so
+  an app update or reinstall can't wipe your codes.
+- Codes typed straight onto the tab in Excel (Type = CPT or ICD-10) show up
+  in the app on its next launch or after Settings → **Sync code library now**.
+- First sync from a phone keeps any codes that exist only on that phone and
+  adds them to the tab.
+- If the same code is changed in Excel and on the phone between syncs, the
+  phone's change wins.
+- sw.js `chargecap-v26`.
 
+---
 
-## v1.12 (2026-10-16) — what changed
-- **Sync can no longer silently skip a case.** Cause of the 10/3–10/15
-  gap: when the ~1-hr Google token had expired, the app's silent re-sign-in
-  could fail without Google ever answering (iOS home-screen apps block the
-  hidden popup), and the save's sync then waited forever — the case was
-  never queued, so no banner and no retry. Now every case is queued before
-  any network work and only removed once the sheet write succeeds; silent
-  sign-in has an error handler + 20 s timeout; the queue retries whenever
-  the app comes back to the foreground.
-- **Settings → "Missing from the sheet".** Compares every case on the phone
-  with the sheet (date of service + MRN, or name if no MRN) and lists what
-  isn't there, with checkboxes and an "Add N to sheet" button. Also runs on
-  launch and shows a yellow banner if anything is missing.
-- **Row-pointer safety.** Before updating a case's row in place (e.g.
-  billed toggle), the app checks the row is still that patient; if rows
-  moved it finds the right one or appends, instead of overwriting.
-- **Screen-banner names.** Reads the name when it shares a line with
-  sex/age/DOB/MRN, hyphenated/apostrophe names, "de la"-style surnames,
-  leading icons; ignores "Allergies: X, Y"; keeps middle initials on
-  "LAST, FIRST M" stickers. A second OCR pass (local contrast
-  normalization) runs only when the first pass misses a field.
-- (Superseded in v1.13) A FILTER-view Non-Op Consults tab.
-- sw.js CACHE_VERSION chargecap-v23.
+# ChargeCap v2.0: Microsoft 365
 
-Surgical charge capture PWA for Dr. Paulk. Built to spec against
-`ChargeCap_Spec_and_Build_Guide.docx`. This replaces the earlier v0.6
-Claude.ai chat prototype with a real, installable app.
+v2.0 moves sync from Google Sheets to an **Excel workbook in the practice's
+Microsoft 365 OneDrive** (`ChargeCap/ChargeCap Log.xlsx`), covered by the
+practice's Microsoft 365 BAA. Capture, OCR, coding and the phone's own case
+list are unchanged. For the v1.x history (Google), see the README in
+`chargecap-v1.13`.
 
-## What's already done
+## What changed from v1.13
+- **Sign-in:** MSAL.js 3.30.0 (bundled as `msal-browser.min.js`), Entra app
+  "ChargeCap" (client `8296bb04-…`, tenant `3602a33d-…`), single-tenant,
+  SPA redirect URI `https://stickerscanner.netlify.app/`, delegated
+  User.Read + Files.ReadWrite (+ offline_access). Sign-in uses a full-page
+  redirect, not a popup. Popups were what broke silent sign-in in the iOS
+  home-screen app. Expect about one "tap to reconnect" a day, because
+  Microsoft caps a browser app's refresh token at 24 hours. Before that it
+  refreshes on its own.
+- **Workbook API:** Microsoft Graph Excel REST. Tabs are unchanged:
+  Primary & Co-Surgeon, Assistant, Non-Op Consults (data), All Cases,
+  Monthly Tally (formulas).
+- **Newest cases at the top.** A new case is inserted at its date position,
+  above every row with the same or an older date. A case entered late goes
+  in with its own date. All Cases and Monthly Tally are newest first too.
+  Because inserts shift rows, each sync re-reads the tab and finds the case
+  by date + MRN (or name). When two cases share both, the CPT list and the
+  last row number decide.
+- **Month breaks.** Conditional formatting on every data tab and All Cases:
+  the first (newest) row of each month has a thick teal line above it,
+  bold text, and a dark-teal date cell. Alternate months are lightly
+  tinted. It's formatting, not extra rows, so it stays right through hand
+  edits and sorting.
+- **Typed cells.** Date, DOB and Billed Date are real Excel dates. Every
+  other column is text, so MRNs keep leading zeros and "99222-57" stays as
+  typed.
+- **Upgrade from v1.13:** on first launch the app drops the old
+  Google-sheet row pointers and the Google token/sheet id (cases are
+  untouched). The first sync then re-links every case to its row in the
+  workbook.
+- `todayISO()` now uses the local date. It was UTC, so after 6pm the
+  default date of service was tomorrow.
+- sw.js `chargecap-v25`: caches only GETs of the app's own files and the
+  CDN libraries. v1.x matched every URL by mistake: `"./"` became `""`,
+  and every URL ends with `""`. With Graph, that could have served stale
+  workbook reads.
 
-- Full UI: capture flow (OCR sticker scan → patient info → role/modifier →
-  CPT codes → ICD-10 codes → notes), case list with All/Pending/Billed
-  filters and search, settings panel.
-- "Scan patient sticker" opens a live in-page camera preview (not the
-  phone's own camera app) with an on-screen guide box — align the
-  sticker in the box and tap "Capture" — the photo is cropped to exactly
-  that box before handing off to OCR. (Auto-capture was removed in
-  v1.11.) Photos of an EHR screen banner (light text on dark, name as
-  "First M. Last") are also read; the Facility field defaults to the last
-  one you used.
-- Code favorites (`data.js`) were rebuilt on 2026-09-23 from the updated
-  "Billing Sheet - OR.xlsx". When `FAVORITES_VERSION` in `data.js` is
-  bumped, the app refreshes the phone's saved code library on next launch,
-  keeping any codes you added yourself in the app. "Use camera app instead" falls back to the old tap-and-shoot flow (which
-  also kicks in automatically if the browser can't do live camera
-  access, or camera permission is denied).
-- On-device OCR via Tesseract.js — no server involved, extracts patient
-  name / MRN / DOB with a confidence-based yellow highlight on fields
-  worth double-checking. Parsing targets patient ID stickers
-  specifically (not general face sheets).
-- CPT and ICD-10 favorite libraries pulled directly from your OR billing
-  sheets (`Billing Sheet - OR.xlsx` and `Billing Sheet - 11.04.22.xlsx`),
-  organized by the categories from the spec (Bariatric, Revision, Hernia,
-  Cholecystectomy, Appendix, Bowel, Upper GI, Endoscopy, HPB,
-  Thyroid/Parathyroid, E&M, Component Separation), plus live ICD-10
-  search against the free NLM ClinicalTables API.
-- IndexedDB storage (via idb-keyval) — replaces the old localStorage
-  prototype, persists across sessions and reinstalls.
-- Red/green billing status toggle with timestamp, full case editing.
-- Biller export (formatted text → clipboard) and CSV export (all /
-  billed / pending).
-- PWA manifest + service worker — installs to the iPhone home screen and
-  the app shell works offline once it's been opened once.
-- Google Drive sync, coded and ready, but **disabled until you supply a
-  Client ID** (see Phase 2 below) — everything else works without it.
-  Once connected, every saved case backs up automatically to a Google
-  Sheet split into a Primary/Co-Surgeon tab and an Assistant tab, plus
-  an auto-updating Monthly Tally of Bariatric/EGD/Back/General Surgery/
-  Tummy Tuck case counts.
+## Files
+- `app.js`, `index.html`, `sw.js`, `styles.css`, `data.js`, `manifest.json`,
+  `icons/`: the app.
+- `msal-browser.min.js`: Microsoft's sign-in library, served with the app.
+- `chargecap-template.xlsx`: a blank workbook (tabs, headers, formats, month
+  breaks, **no patient data**). The app uploads it only if
+  `ChargeCap/ChargeCap Log.xlsx` doesn't exist yet in OneDrive.
+- **Not deployed** (kept outside this folder, contains PHI):
+  `ChargeCap Log.xlsx` has the 330 cases merged from Tribble (Apr 1–Sep 1)
+  and the Google sheet (Sep 4 on).
+- `../chargecap-v2.0-extras/weekly-biller-report.ts` is the Office Script
+  for the Monday biller email.
 
-**Important — verify before relying on it for billing:** the CPT/ICD-10
-codes in `data.js` were transcribed from your existing Excel billing
-sheets, which had some evident typos in the source. Skim `data.js` (or
-the code picker in the app) against current documentation before you
-lean on it for actual claims. Codes can be edited directly in `data.js`.
+## Setup, in this order
+1. **Upload the seeded workbook first.** In OneDrive (office.com → OneDrive),
+   create a folder named `ChargeCap` and upload `ChargeCap Log.xlsx` into it.
+   The name must be exact. If the app connects before this file exists, it
+   creates a blank workbook in that spot instead.
+2. **Deploy** this folder to Netlify (drag the whole folder onto Deploys).
+3. **Phone:** don't delete the home-screen app. Close it fully and reopen
+   it once or twice until Settings → About says **ChargeCap v2.0**.
+4. **Settings → Connect Microsoft 365** → sign in with the practice account
+   → you land back in the app. The first sync re-links your cases to their
+   rows.
+5. **Settings → Missing from the workbook → Check.** Review anything it
+   lists before tapping Add (see the notes below).
+6. **Weekly biller email:** see the next section. Then **turn off the
+   Google Apps Script trigger**. Otherwise it keeps emailing the frozen
+   Google sheet's pending rows every Monday.
 
-## What's left — deployment (Phase 1, ~20 min)
+## Weekly biller email (Power Automate + Office Script)
+1. Open `ChargeCap Log.xlsx` in Excel for the web → **Automate** tab →
+   **New Script**. Replace the code with `weekly-biller-report.ts`, name it
+   **ChargeCap weekly biller report**, then Save.
+2. make.powerautomate.com → **Create → Scheduled cloud flow**. Name it
+   "ChargeCap weekly biller report". Repeat every 1 week, Monday. Then edit
+   the Recurrence step: Time zone (UTC-07:00) Mountain Time, At these hours
+   6, At these minutes 0.
+3. **+ New step → Excel Online (Business) → Run script.** Location OneDrive
+   for Business, Document Library OneDrive, File
+   `/ChargeCap/ChargeCap Log.xlsx`, Script **ChargeCap weekly biller
+   report**, mode `collect`.
+4. **Data Operation → Parse JSON.** Content = `result` from Run script.
+   Schema:
+   `{"type":"object","properties":{"count":{"type":"integer"},"csv":{"type":"string"},"keys":{"type":"string"}}}`
+5. **Condition:** `count` is greater than 0. In the **If yes** branch:
+   - **Office 365 Outlook → Send an email (V2).** To `rnaylor@rmapinc.com`.
+     Subject `Weekly billing report for Dr. Paulk`. Body: a short note.
+     Under Advanced, add yourself as BCC. Attachments Name
+     `ChargeCap pending @{formatDateTime(convertFromUtc(utcNow(),'Mountain Standard Time'),'yyyy-MM-dd')}.csv`,
+     Attachments Content = `csv` (from Parse JSON).
+   - **Excel Online (Business) → Run script** again: same file and script,
+     mode `mark`, keys = `keys` (from Parse JSON), billedDate =
+     `@{formatDateTime(convertFromUtc(utcNow(),'Mountain Standard Time'),'M/d/yyyy')}`.
+   Because this runs after Send email, rows are marked "done" only if the
+   email went out.
+6. Test with **Test → Manually** after temporarily changing To to your own
+   address. Note: a test run marks the rows done, so pick a time when
+   that's what you want, or flip them back to "pending" afterwards.
 
-You don't need to touch the app code for this part.
+## Things to watch on the first real use
+- **All Cases** and **Monthly Tally** use ordinary formulas only. They
+  work in every Excel since 2010 and in Excel for the web. A first version
+  used VSTACK, which older Excel doesn't have, and came up blank.
+  All Cases merges the three newest-first data tabs row by row, using
+  hidden helper columns P–W, and covers 5,000 cases. Monthly Tally covers
+  240 months. Both are built into the workbook files. The app only rewrites
+  them if one of those tabs is deleted.
+- Every formula range into a data tab starts at **row 1**. The app inserts
+  new cases at row 2, and Excel shifts, rather than grows, a range whose
+  first row is the insert point. LibreOffice test: insert at A2:O2 → All
+  Cases 330→331 with the new case on top, Oct tally 41→42.
+- All Cases assumes each data tab stays newest-first (the app keeps it
+  that way). A row typed out of order by hand still shows up, just slightly
+  out of order.
+- iOS home-screen app + Microsoft sign-in redirect: the login page opens
+  inside the app, then comes back. If it gets stuck in Safari instead,
+  that is the thing to report.
+- Phone cases dated before 9/4 that aren't in Tribble (or whose MRN was
+  typed differently) will be listed under "Missing from the workbook".
+  Review them before adding.
 
-1. **Push to GitHub.** From this folder:
-   ```
-   git init
-   git add .
-   git commit -m "ChargeCap v1.0"
-   ```
-   Create a new repo called `chargecap` at github.com/new, then:
-   ```
-   git remote add origin https://github.com/YOUR-USERNAME/chargecap.git
-   git branch -M main
-   git push -u origin main
-   ```
-2. **Deploy to Netlify.**
-   - netlify.com → Add new site → Import an existing project → GitHub →
-     select `chargecap`.
-   - Build command: leave blank. Publish directory: `/` (repo root).
-   - Deploy. You'll get a URL like `chargecap-abc123.netlify.app`.
-3. **Install on iPhone.** Open the Netlify URL in **Safari** (not
-   Chrome — iOS only supports PWA install from Safari) → Share button →
-   Add to Home Screen.
-
-At this point the app is fully usable — capture, code, export CSV, copy
-biller text — with data stored locally on the phone.
-
-## What's left — Google Drive sync (Phase 2, optional, ~15 min)
-
-1. console.cloud.google.com → New Project → name it ChargeCap.
-2. APIs & Services → Library → enable **Google Drive API** and
-   **Google Sheets API**.
-3. APIs & Services → OAuth consent screen → External → fill in the app
-   name (ChargeCap) and your email, then **Audience → Test users → Add
-   users** and add your own Google account's email. Without this step
-   sign-in fails with "Error 403: access_denied" even with a correct
-   Client ID, because the app starts in "Testing" publish status and
-   only whitelisted test users can sign in.
-4. APIs & Services → Credentials → Create Credentials → OAuth client ID
-   → Application type: **Web application**.
-5. Under Authorized JavaScript origins, add your Netlify URL, e.g.
-   `https://chargecap-abc123.netlify.app`. (No redirect URI needed —
-   this uses Google Identity Services' token flow, which only checks
-   the origin.)
-6. Copy the generated Client ID (looks like
-   `123456-abc.apps.googleusercontent.com`).
-7. Open the app → Settings → paste it into "Google OAuth Client ID" →
-   Save → Connect Google Drive → sign in and grant Sheets access.
-
-From then on, **every saved case backs up automatically** — no need to
-mark it billed first — to a spreadsheet named **ChargeCap Log** created
-automatically in your Drive, with four tabs:
-
-- **Primary & Co-Surgeon** — one row per case where your role is
-  Primary or Co-surgeon.
-- **Assistant** — one row per case where your role is Assistant.
-- **All Cases** — a hidden helper tab that just unions the two above;
-  no need to look at it directly.
-- **Monthly Tally** — (v1.11) counts Primary & Co-Surgeon cases only, and
-  has a separate **Non-Op Consults** column after Total: a case whose CPT
-  codes are ALL consult codes (`CONSULT_CPT`: 99221, 99222, 99223, 99232,
-  99238, 99252, 99253, 99254, 99255) is tagged "Non-Op Consult" and is not counted in
-  any surgical category or in Total. Older notes below:
-  auto-counts, per month, how many Bariatric / EGD /
-  Back / General Surgery cases you logged (across both role tabs
-  combined). Each is determined by CPT code (see `BARIATRIC_CPT` /
-  `EGD_CPT` / `BACK_CPT` near the top of `app.js` if those code lists
-  ever need to change); checked in that order, so a case matching more
-  than one list only counts once, under the first one it matches (e.g.
-  a bariatric case that also has an on-table EGD code still counts as
-  Bariatric — `BACK_CPT` currently covers 22558/22585). Everything else
-  counts as General Surgery. This tab is entirely spreadsheet formulas
-  — it recalculates itself as new rows land, nothing in the app has to
-  push counts to it. If you already connected Drive before this change,
-  the next case you save will automatically add the Back column and
-  reshuffle the tally formulas into place — no manual spreadsheet
-  editing needed.
-
-Editing a case and re-saving it, or toggling its billed status, updates
-that case's existing row in place rather than adding a duplicate — and
-if you change a case's role after it's already synced, the old row is
-cleared and a fresh one is added to the correct tab. If you're offline,
-syncs queue and go out the next time you're online and signed in.
-
-You can skip this phase entirely and just use CSV export / biller-text
-copy as your sync method — nothing else in the app depends on it.
-
-**Heads up on patient data:** this sends full case data — including
-patient name and MRN — to a spreadsheet in your own Google Drive. Only
-your Google account can see it (no other server is involved), but it's
-worth being deliberate about who has access to that Drive account and
-whether your practice's policies are fine with PHI living in Google
-Sheets before you turn this on.
-
-## Local testing before you deploy
-
-Any static file server works, e.g. from this folder:
-```
-npx serve .
-```
-Then open the printed `localhost` URL in a browser. (The camera/OCR
-flow needs a real device or a browser that lets you pick an image file
-as the "camera" input — desktop Chrome will just open a file picker,
-which is fine for testing the OCR parsing logic.)
-
-## Updating the app later
-
-Edit the files, `git add . && git commit -m "..." && git push` — Netlify
-redeploys automatically in under a minute. If you change `app.js`,
-`styles.css`, or `data.js`, bump `CACHE_VERSION` at the top of `sw.js`
-so installed phones pick up the new version instead of serving a stale
-cached copy.
-
-## Architecture reference
-
-| Layer | Technology |
-|---|---|
-| Frontend | Vanilla HTML/CSS/JS (no framework) |
-| OCR | Tesseract.js 5.x, on-device |
-| ICD-10 live search | NLM ClinicalTables API (free, no key) |
-| Local storage | IndexedDB via idb-keyval |
-| Sync | Google Sheets API v4 (one row per billed case) |
-| Auth | Google Identity Services OAuth 2.0 (browser-only, no backend) |
-| Hosting | Netlify free tier (HTTPS, auto-deploy from GitHub) |
-| PWA | manifest.json + service worker, installs to iOS home screen |
-
-## Security note (from the original spec)
-
-OAuth tokens live in the browser's own storage. No patient data is sent
-anywhere except your own Google Drive under your own Google account —
-there is no backend server. HTTPS is enforced by Netlify. If you want to
-avoid storing PHI in Drive entirely, an earlier version of this plan
-called for stripping identifiers before sync since the EMR already holds
-the chart — worth a final decision on which approach you want before
-Phase 2, since switching later just means editing the `caseToRow()` /
-`SHEET_HEADER` fields in `app.js`.
+## Local testing
+`npx serve .`, then open the localhost URL. Microsoft sign-in only works
+from the registered redirect URI, so a local copy can't sync. The mocked
+test (`/tmp/cctest/test.js` in the build session) covers sync logic.

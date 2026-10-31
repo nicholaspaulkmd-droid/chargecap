@@ -3,20 +3,22 @@
 // Bump CACHE_VERSION whenever app.js/styles.css/data.js change so clients
 // pick up the new version instead of serving a stale cache forever.
 
-const CACHE_VERSION = "chargecap-v24";
+const CACHE_VERSION = "chargecap-v26";
 const APP_SHELL = [
   "./",
   "./index.html",
   "./styles.css",
   "./app.js",
   "./data.js",
+  "./msal-browser.min.js",
   "./manifest.json",
   "./icons/icon-192.png",
   "./icons/icon-512.png",
 ];
+const SHELL_PATHS = new Set(APP_SHELL.map((p) => new URL(p, self.location).pathname));
 
-// Third-party libraries loaded from CDN — cached opportunistically (see
-// fetch handler below) so OCR/storage keep working offline after first load.
+// Third-party libraries loaded from CDN — cached opportunistically so
+// OCR/storage keep working offline after first load.
 const CDN_HOSTS = ["unpkg.com"];
 
 self.addEventListener("install", (event) => {
@@ -34,26 +36,29 @@ self.addEventListener("activate", (event) => {
 });
 
 self.addEventListener("fetch", (event) => {
-  const url = new URL(event.request.url);
+  const req = event.request;
+  // v2.0: only GETs of our own app files and the CDN libraries are
+  // cached. Everything else — Microsoft sign-in, Graph API calls, the
+  // workbook template — always goes straight to the network. (v1.x
+  // matched every URL by mistake: "./" became "", and every URL ends
+  // with "", so API reads could have been answered from cache.)
+  if (req.method !== "GET") return;
+  const url = new URL(req.url);
+  const isShell = url.origin === self.location.origin && SHELL_PATHS.has(url.pathname);
+  if (!isShell && !CDN_HOSTS.includes(url.hostname)) return;
 
-  // Never cache Google APIs / auth — always go to network for these.
-  if (url.hostname.includes("google")) return;
-
-  // App shell + CDN libs: cache-first, falling back to network, and
-  // updating the cache in the background (stale-while-revalidate).
-  if (APP_SHELL.some((p) => event.request.url.endsWith(p.replace("./", ""))) || CDN_HOSTS.includes(url.hostname)) {
-    event.respondWith(
-      caches.match(event.request).then((cached) => {
-        const fetchPromise = fetch(event.request)
-          .then((networkResp) => {
-            if (networkResp && networkResp.ok) {
-              caches.open(CACHE_VERSION).then((cache) => cache.put(event.request, networkResp.clone()));
-            }
-            return networkResp;
-          })
-          .catch(() => cached);
-        return cached || fetchPromise;
-      })
-    );
-  }
+  event.respondWith(
+    caches.match(req, { ignoreSearch: isShell }).then((cached) => {
+      const fetchPromise = fetch(req)
+        .then((networkResp) => {
+          if (networkResp && networkResp.ok) {
+            const copy = networkResp.clone();
+            caches.open(CACHE_VERSION).then((cache) => cache.put(req, copy));
+          }
+          return networkResp;
+        })
+        .catch(() => cached);
+      return cached || fetchPromise;
+    })
+  );
 });
