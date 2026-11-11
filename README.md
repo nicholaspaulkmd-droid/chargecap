@@ -1,4 +1,11 @@
-# ChargeCap v2.1: Microsoft 365 + code library backup
+# ChargeCap v2.2: Microsoft 365 + code library backup
+
+## New in v2.2 (2026-11-11)
+- Fix: if the workbook in OneDrive is replaced or re-uploaded, the app finds the new file instead of failing forever on the old file ID.
+- Worksheets are addressed by ID rather than by name ("Primary & Co-Surgeon" has an "&" in it).
+- Settings → Diagnostics: "Run connection test" checks each step (sign-in, OneDrive, folder, file, Excel opening it, each tab) and shows Microsoft's actual error. "Copy results" contains no PHI.
+- The last sync error is saved and shown in Diagnostics, instead of going only to the console.
+- Service worker cache chargecap-v27.
 
 ## New in v2.1 (2026-10-31)
 - **Code library backup.** The CPT/ICD-10 library is now also stored on a

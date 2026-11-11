@@ -1,4 +1,4 @@
-// app.js — ChargeCap v2.1
+// app.js — ChargeCap v2.2
 // Vanilla JS, no framework. Uses idb-keyval (IndexedDB) for storage,
 // Tesseract.js for on-device OCR, NLM ClinicalTables API for live ICD-10
 // search, and MSAL.js + Microsoft Graph for sync to an Excel workbook in
@@ -1434,8 +1434,17 @@ function renderSettings() {
       </section>
 
       <section class="card">
+        <h2>Diagnostics</h2>
+        <p class="muted">Tests each step of the Microsoft 365 connection. The results contain no patient information (only file names, tab names and row counts), so they're safe to copy and paste to whoever is helping you.</p>
+        ${state.lastSyncError ? `<p class="hint"><strong>Last error</strong> (${escapeHtml(state.lastSyncError.where)}, ${new Date(state.lastSyncError.at).toLocaleString()}):<br><code class="small">${escapeHtml(state.lastSyncError.msg)}</code></p>` : ""}
+        <button id="diagBtn" class="secondary-btn" ${state.diagBusy ? "disabled" : ""}>${state.diagBusy ? "Testing…" : "Run connection test"}</button>
+        ${state.diagLines ? `<pre class="small" style="white-space:pre-wrap;word-break:break-word;">${escapeHtml(state.diagLines.join("\n"))}</pre>
+        <button id="diagCopyBtn" class="secondary-btn">Copy results</button>` : ""}
+      </section>
+
+      <section class="card">
         <h2>About</h2>
-        <p class="muted">ChargeCap v2.1 · ${CASES.length} case(s) stored locally on this device (IndexedDB).</p>
+        <p class="muted">ChargeCap v2.2 · ${CASES.length} case(s) stored locally on this device (IndexedDB).</p>
         <p class="muted small">CPT/ICD-10 favorites were imported from your OR billing sheets — double-check codes against current documentation before relying on them for claims.</p>
       </section>
     </div>`;
@@ -1827,6 +1836,14 @@ function bindSettingsEvents() {
   if (codeSyncBtn) codeSyncBtn.addEventListener("click", () => syncCodeLibrary({ manual: true }));
   const reconcileBtn = document.getElementById("reconcileBtn");
   if (reconcileBtn) reconcileBtn.addEventListener("click", () => reconcileWithSheet({ manual: true }));
+  const diagBtn = document.getElementById("diagBtn");
+  if (diagBtn) diagBtn.addEventListener("click", runDiagnostics);
+  const diagCopyBtn = document.getElementById("diagCopyBtn");
+  if (diagCopyBtn) diagCopyBtn.addEventListener("click", () =>
+    navigator.clipboard.writeText(diagReportText()).then(
+      () => toast("Test results copied"),
+      () => toast("Could not copy — select the text and copy it by hand", true)
+    ));
   const addMissingBtn = document.getElementById("addMissingBtn");
   if (addMissingBtn) addMissingBtn.addEventListener("click", addMissingToSheet);
   app.querySelectorAll("[data-missing-toggle]").forEach((el) =>
@@ -2260,7 +2277,21 @@ async function findOrCreateWorkbook() {
 }
 
 const wbPath = (itemId) => `/me/drive/items/${itemId}/workbook`;
-const wsPath = (itemId, tab) => `${wbPath(itemId)}/worksheets('${encodeURIComponent(tab.replace(/'/g, "''"))}')`;
+// v2.2: worksheets are addressed by their ID once known, not by name.
+// "Primary & Co-Surgeon" contains an "&", and a name in the URL is the
+// fragile part; the ID ({00000000-0001-...}) has no special characters.
+let SHEET_IDS = { itemId: null, byName: {} };
+const wsPathByName = (itemId, tab) => `${wbPath(itemId)}/worksheets('${encodeURIComponent(tab.replace(/'/g, "''"))}')`;
+const wsPath = (itemId, tab) => {
+  const id = SHEET_IDS.itemId === itemId && SHEET_IDS.byName[tab];
+  return id ? `${wbPath(itemId)}/worksheets/${encodeURIComponent(id)}` : wsPathByName(itemId, tab);
+};
+async function loadSheetIds(itemId) {
+  const sheets = await graphJson(`${wbPath(itemId)}/worksheets?$select=id,name`);
+  const list = sheets.value || [];
+  SHEET_IDS = { itemId, byName: Object.fromEntries(list.map((x) => [x.name, x.id])) };
+  return list;
+}
 const rangePath = (itemId, tab, addr) => `${wsPath(itemId, tab)}/range(address='${addr}')`;
 
 // ---- Formulas (All Cases + Monthly Tally) ---------------------------
@@ -2359,21 +2390,21 @@ async function ensureWorkbookSchema(itemId) {
 }
 
 async function ensureWorkbook() {
-  const itemId = await findOrCreateWorkbook();
+  let itemId = await findOrCreateWorkbook();
   try {
-    await ensureWorkbookSchema(itemId);
+    // One cheap request per sync. It also proves the stored file ID still
+    // points at a real workbook: in v2.1 a replaced/re-uploaded file left
+    // the phone asking for the old ID forever.
+    await loadSheetIds(itemId);
   } catch (err) {
-    // The stored item may have been deleted/replaced in OneDrive — look
-    // it up again by path once before giving up.
-    if (err.status === 404 || /itemNotFound/i.test(err.message)) {
-      await setMeta("workbookItemId", null);
-      await setMeta("wbSchemaReady", null);
-      const again = await findOrCreateWorkbook();
-      await ensureWorkbookSchema(again);
-      return again;
-    }
-    throw err;
+    if (err.status !== 404 && !/itemNotFound/i.test(err.message)) throw err;
+    await setMeta("workbookItemId", null);
+    await setMeta("wbSchemaReady", null);
+    itemId = await findOrCreateWorkbook();
+    await loadSheetIds(itemId);
   }
+  await ensureWorkbookSchema(itemId);
+  if (ALL_TABS.some((t) => !SHEET_IDS.byName[t])) await loadSheetIds(itemId);
   return itemId;
 }
 
@@ -2568,6 +2599,14 @@ async function dequeueSync(id) {
   await setMeta("syncQueue", SYNC_QUEUE);
 }
 
+// v2.2: keep the real error so it can be seen in Settings → Diagnostics
+// (it used to go only to the browser console, which a phone can't show).
+async function recordSyncError(where, err) {
+  const msg = String((err && (err.message || err.errorCode)) || err || "unknown error").slice(0, 600);
+  state.lastSyncError = { where, at: Date.now(), msg };
+  try { await setMeta("lastSyncError", state.lastSyncError); } catch { /* ignore */ }
+}
+
 async function syncCaseToDrive(c, { quiet = false } = {}) {
   await enqueueSync(c.id);
   if (syncInFlight.has(c.id)) return;
@@ -2610,7 +2649,102 @@ async function syncCaseInner(c, { quiet }) {
     render();
   } catch (err) {
     console.error(err);
-    if (!quiet) toast("Sync failed — queued, will retry", true);
+    await recordSyncError("Saving a case", err);
+    if (!quiet) toast("Sync failed — queued, will retry (details: Settings → Diagnostics)", true);
+  }
+}
+
+// ---- Diagnostics (v2.2) ---------------------------------------------
+// Runs every step of the sync path one at a time and reports which one
+// fails, with Microsoft's own error text. No PHI: names, sizes, counts.
+function diagReportText() {
+  const lines = [...(state.diagLines || [])];
+  if (state.lastSyncError) lines.push("", `Last error (${state.lastSyncError.where}, ${new Date(state.lastSyncError.at).toISOString()}): ${state.lastSyncError.msg}`);
+  return lines.join("\n");
+}
+
+async function runDiagnostics() {
+  const out = [`ChargeCap v2.2 connection test — ${new Date().toLocaleString()}`];
+  const ok = (m) => out.push("✓ " + m);
+  const bad = (m, err) => out.push("✗ " + m + (err ? ` — ${String(err.message || err).slice(0, 400)}` : ""));
+  const show = () => { state.diagLines = [...out]; render(); };
+  state.diagBusy = true; show();
+  try {
+    // 1. Sign-in
+    if (!(await initMsal())) { bad("Microsoft sign-in library didn't load (offline?)"); return; }
+    const acct = msalApp.getActiveAccount();
+    if (!acct) { bad("Not signed in — tap Connect Microsoft 365"); return; }
+    ok(`Signed in as ${acct.username} (tenant ${acct.tenantId || "?"})`);
+    if (acct.tenantId && acct.tenantId !== M365_TENANT_ID) bad(`That account is in a different tenant than the app (${M365_TENANT_ID})`);
+    const token = await getGraphToken({ forceRefresh: true });
+    if (!token) { bad("Couldn't get an access token — tap Reconnect"); return; }
+    try {
+      const claims = JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+      ok(`Token scopes: ${claims.scp || "(none)"}`);
+    } catch { ok("Got an access token"); }
+    show();
+
+    // 2. OneDrive + folder contents
+    try {
+      const drive = await graphJson("/me/drive?$select=driveType,webUrl");
+      ok(`OneDrive reachable (${drive.driveType})`);
+    } catch (err) { bad("Couldn't open your OneDrive", err); return; }
+    try {
+      const kids = await graphJson(`/me/drive/root:/${encodeURIComponent(WORKBOOK_FOLDER)}:/children?$select=name,size,lastModifiedDateTime,file`);
+      const files = (kids.value || []).map((f) => `${f.name} (${Math.round((f.size || 0) / 1024)} KB, modified ${f.lastModifiedDateTime})`);
+      ok(`Files in /${WORKBOOK_FOLDER}: ${files.length ? files.join("; ") : "(empty)"}`);
+    } catch (err) { bad(`Couldn't list the /${WORKBOOK_FOLDER} folder`, err); }
+    show();
+
+    // 3. The workbook file
+    let item;
+    try {
+      item = await graphJson(`/me/drive/root:/${encodeURIComponent(WORKBOOK_FOLDER)}/${encodeURIComponent(WORKBOOK_FILE)}?$select=id,name,size`);
+      ok(`Found ${item.name}`);
+    } catch (err) { bad(`No file named exactly "${WORKBOOK_FILE}" in /${WORKBOOK_FOLDER}`, err); return; }
+    const cached = await getMeta("workbookItemId", null);
+    if (cached && cached !== item.id) {
+      bad("The phone was pointing at an older copy of the workbook — fixed now");
+      await setMeta("workbookItemId", item.id);
+      await setMeta("wbSchemaReady", null);
+    } else ok(cached ? "Phone is pointing at this file" : "Phone hadn't linked a file yet — linked now");
+    if (!cached) await setMeta("workbookItemId", item.id);
+    show();
+
+    // 4. Open it with Excel Online
+    let sheets;
+    const t0 = Date.now();
+    try {
+      sheets = await loadSheetIds(item.id);
+      ok(`Excel opened the workbook in ${((Date.now() - t0) / 1000).toFixed(1)} s. Tabs: ${sheets.map((x) => x.name).join(", ")}`);
+    } catch (err) { bad("Excel Online couldn't open the workbook", err); return; }
+    const missing = ALL_TABS.filter((t) => !sheets.some((x) => x.name === t));
+    if (missing.length) bad(`Missing tabs (names must match exactly): ${missing.join(", ")}`);
+    show();
+
+    // 5. Read each data tab, by ID and (for comparison) by name
+    for (const tab of DATA_TABS) {
+      if (!SHEET_IDS.byName[tab]) continue;
+      try {
+        const b = await graphJson(`${wsPath(item.id, tab)}/usedRange(valuesOnly=true)?$select=address`);
+        ok(`Read "${tab}": ${b.address}`);
+      } catch (err) { bad(`Couldn't read "${tab}"`, err); }
+      try {
+        await graphJson(`${wsPathByName(item.id, tab)}/usedRange(valuesOnly=true)?$select=address`);
+      } catch (err) { out.push(`  (by name it fails: ${String(err.message).slice(0, 200)})`); }
+      show();
+    }
+
+    // 6. The whole read the app actually does
+    try {
+      const tabs = await readDataTabs(item.id);
+      ok("Full read used by sync: " + DATA_TABS.map((t) => `${t} ${tabs[t].rows.length} rows`).join(", "));
+    } catch (err) { bad("The sync's own read failed", err); }
+  } catch (err) {
+    bad("Unexpected error", err);
+  } finally {
+    state.diagBusy = false;
+    show();
   }
 }
 
@@ -2661,7 +2795,8 @@ async function reconcileWithSheet({ manual = false } = {}) {
     if (manual) toast(missing.length ? `${missing.length} case(s) on this phone are not in the workbook` : "Everything on this phone is in the workbook ✓", !!missing.length);
   } catch (err) {
     console.error(err);
-    if (manual) toast("Couldn't read the workbook — try again", true);
+    await recordSyncError("Check for missing cases", err);
+    if (manual) toast("Couldn't read the workbook — details in Settings → Diagnostics", true);
   } finally {
     state.reconcileBusy = false;
     render();
@@ -2840,6 +2975,7 @@ async function syncCodeLibrary({ manual = false } = {}) {
     if (state.codeLibPending) scheduleCodeLibrarySync();
   } catch (err) {
     console.error("Code library sync failed", err);
+    await recordSyncError("Code library sync", err);
     if (manual) toast("Code library sync failed — your changes are saved on this phone and will retry", true);
   } finally {
     codeSyncing = false;
@@ -2903,6 +3039,7 @@ async function boot() {
   await loadCodes();
   state.lastFacility = await getMeta("lastFacility", null);
   SYNC_QUEUE = (await getMeta("syncQueue", [])) || [];
+  state.lastSyncError = await getMeta("lastSyncError", null);
   await migrateToM365();
   render();
 
